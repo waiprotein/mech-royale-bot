@@ -2163,6 +2163,8 @@ func applyFlags(p *Params, spec string) {
 			p.PracAt = f
 		case "beamffa":
 			p.BeamFFA = on
+		case "laserseek":
+			p.LaserSeek = f
 		case "lethalk":
 			p.LethalK = f
 		case "backstab":
