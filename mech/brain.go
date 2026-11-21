@@ -188,6 +188,11 @@ type Params struct {
 	// giddy: 3. 0 disables it, so retreat stays allowed with 3 or fewer alive (the LateR half still applies).
 	// squadParams resets it to 3, so practice play is unchanged.
 	LateAlive int
+	// LightLOS [lightlos]: FFA-only (gated on !pracOn: base params, i.e. before PracAt or after the FFA latch).
+	// When lightning is our only second weapon and the foe (the target, or the hidden foe we would peek)
+	// holds a laser beyond lightning range + 5 m, take the swamped -> retreat -> cover path (break LOS)
+	// instead of trading gun fire, unless we are finishing it.
+	LightLOS bool
 }
 
 func DefaultParams() Params {
@@ -707,6 +712,12 @@ func (b *Brain) step(o *Obs, act *Action) {
 		b.oddsFleeUntil = now + 5
 	}
 	if now < b.oddsFleeUntil && !finishing {
+		swamped = true
+	}
+	// lightlos: FFA-only (!pracOn). foe = target, else the hidden foe Peek would step out to; using it keeps us
+	// from peeking back into a laser's line once we have broken it.
+	if b.P.LightLOS && !b.pracOn && light != nil && laser == nil && foe != nil && !finishing &&
+		holds(foe.Weapons, "laser") && foe.Dist > light.Stats.Range+5 {
 		swamped = true
 	}
 	if !b.retreat && ((hpFrac < b.P.RetreatHP && now-b.lastThreatAt < 2) || swamped) {
@@ -2217,6 +2228,8 @@ func applyFlags(p *Params, spec string) {
 			p.GunOnlyOut = on
 		case "lateal":
 			p.LateAlive = int(f)
+		case "lightlos":
+			p.LightLOS = on
 		}
 	}
 }
