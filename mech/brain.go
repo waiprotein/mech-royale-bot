@@ -184,6 +184,10 @@ type Params struct {
 	// sends us down the existing swamped -> retreat -> cover path. Not mode-gated, but inert under squad params
 	// because their LoseRule overwrites the retreat flag every tick.
 	GunOnlyOut bool
+	// LateAlive [lateal]: the `alive <= N` half of `late` (no retreat, no shy/evade/hurt-cover in the end game).
+	// giddy: 3. 0 disables it, so retreat stays allowed with 3 or fewer alive (the LateR half still applies).
+	// squadParams resets it to 3, so practice play is unchanged.
+	LateAlive int
 }
 
 func DefaultParams() Params {
@@ -201,6 +205,7 @@ func DefaultParams() Params {
 	p.LateR = 25
 	p.HoldOut = 368
 	p.HoldMin = 60
+	p.LateAlive = 3
 
 	return p
 }
@@ -573,7 +578,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 	if b.P.LateR > 0 {
 		lateR = b.P.LateR
 	}
-	late := z.NextRadius <= lateR || o.Alive <= 3
+	late := z.NextRadius <= lateR || o.Alive <= b.P.LateAlive
 
 	var seen []*Track
 	var target, hidden, shy *Track
@@ -2059,6 +2064,7 @@ func squadParams(p Params) Params {
 	// Keep practice exactly as giddy tuned it: our FFA end-game changes stay off.
 	p.LateR = 70
 	p.HoldOut = 0
+	p.LateAlive = 3
 
 	return p
 }
@@ -2209,6 +2215,8 @@ func applyFlags(p *Params, spec string) {
 			p.OpenUntil = f
 		case "gunonlyout":
 			p.GunOnlyOut = on
+		case "lateal":
+			p.LateAlive = int(f)
 		}
 	}
 }
