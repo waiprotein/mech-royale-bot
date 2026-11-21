@@ -160,6 +160,8 @@ type Params struct {
 	// SqLaserRange / SqFinish: practice-mode overrides for local tests (0 = giddy's 120 / 26).
 	SqLaserRange float64
 	SqFinish     float64
+	// PracAt: match time after which, with no unexplained death yet, practice (squad) params switch on (giddy: 20).
+	PracAt float64
 }
 
 func DefaultParams() Params {
@@ -346,7 +348,11 @@ func (b *Brain) observe(o *Obs) {
 	if b.otherDead >= 5 {
 		b.notPractice = true
 	}
-	if on := b.base.Practice && !b.notPractice && now > 20; on != b.pracOn {
+	pracAt := 20.0
+	if b.base.PracAt > 0 {
+		pracAt = b.base.PracAt
+	}
+	if on := b.base.Practice && !b.notPractice && now > pracAt; on != b.pracOn {
 		b.pracOn = on
 		b.P = b.base
 		if on {
@@ -2083,6 +2089,8 @@ func applyFlags(p *Params, spec string) {
 			p.SqLaserRange = f
 		case "sqfinish":
 			p.SqFinish = f
+		case "pracat":
+			p.PracAt = f
 		}
 	}
 }
