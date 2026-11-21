@@ -113,6 +113,7 @@ type Brain struct {
 	stickAt, loseAt    float64
 	myHitAt            map[int]float64
 	ffaNow             bool
+	dropOKAt           float64 // ffadrops: last time dropsOK passed our loot-target drop (commitment)
 	safeMode           bool
 	exch               map[int]*exchange
 	showCfg            bool
@@ -328,6 +329,13 @@ type Params struct {
 	// fires when on target; otherwise we break its line with coverMove (boost, no new laser charge so we keep
 	// full speed), unless we are finishing a target. 0 = off.
 	ChargeEngage float64
+	// FFADrops [ffadrops]: FFA-only (ffaOn). Turns on giddy's dormant supply-drop path (the UseDrops branches of
+	// chooseLoot, same values and the same "reachable before landing + 25 s" test) only after a proven
+	// free-for-all, with guards (see ffaDropOK): skip a drop another mech is capturing; commit only with no mech
+	// seen within 150 m; once committed, abort (drop barred for 8 s) if a mech hits us or comes within 100 m.
+	// A drop gives full HP, full energy and 3 cubes for 4 s alone in its 8 m ring. UseDrops itself is not
+	// mode-gated and stays off (it would change practice play).
+	FFADrops bool
 }
 
 func DefaultParams() Params {
@@ -2081,7 +2089,7 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 		}
 		for i := range o.Drops {
 			d := &o.Drops[i]
-			if b.P.UseDrops && !hurt && hyp(d.Pos[0]-x, d.Pos[1]-y)/me.Stats.WalkSpeed < d.LandsIn+25 {
+			if !hurt && hyp(d.Pos[0]-x, d.Pos[1]-y)/me.Stats.WalkSpeed < d.LandsIn+25 && b.dropsOK(o, d) {
 				consider("drop", d.ID, d.Pos, 170)
 			}
 		}
@@ -2151,7 +2159,7 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 	for i := range o.Drops {
 		d := &o.Drops[i]
 		dist := hyp(d.Pos[0]-x, d.Pos[1]-y)
-		if b.P.UseDrops && dist/me.Stats.WalkSpeed < d.LandsIn+25 && !danger {
+		if dist/me.Stats.WalkSpeed < d.LandsIn+25 && !danger && b.dropsOK(o, d) {
 			consider("drop", d.ID, d.Pos, 260)
 		}
 	}
@@ -2168,6 +2176,45 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 		return nil
 	}
 	return best
+}
+
+// dropsOK says whether chooseLoot may consider supply drop d. UseDrops (giddy's flag, any mode) keeps giddy's
+// behaviour. FFADrops (ffadrops) allows it only after a proven free-for-all (ffaOn), and only when:
+//   - no other mech is capturing it (holder);
+//   - no mech has hit us in the last 3 s and no mech seen this tick is within 100 m;
+//   - to commit, no mech seen this tick is within 150 m. We stay committed only while the drop is our loot target
+//     and passed on the previous decision; any tick spent in another mode (dodge, unstuck, fight...) ends the
+//     commitment, so resuming needs the 150 m check again.
+//
+// A committed drop that fails is barred for 8 s (b.bad), so we do not walk back as soon as the threat steps out
+// of view. NPC fire does not count: drones do not contest a drop and only chase within their leash.
+func (b *Brain) dropsOK(o *Obs, d *Drop) bool {
+	if b.P.UseDrops {
+		return true
+	}
+	if !b.P.FFADrops || !b.ffaNow {
+		return false
+	}
+	if d.Holder != nil && *d.Holder != o.Self.ID {
+		return false
+	}
+	committed := b.lootID == d.ID && b.now-b.dropOKAt < 0.15
+	for _, t := range b.tracks {
+		if t.Kind != "mech" {
+			continue
+		}
+		threat := b.now-t.HitMe < 3 || (t.Seen == b.now && t.Dist < 100)
+		if threat || (!committed && t.Seen == b.now && t.Dist < 150) {
+			if committed {
+				b.bad[d.ID] = b.now + 8
+			}
+			return false
+		}
+	}
+	if b.lootID == d.ID || committed {
+		b.dropOKAt = b.now
+	}
+	return true
 }
 
 func (b *Brain) exploreMove(o *Obs) (float64, float64) {
@@ -2621,6 +2668,7 @@ func squadParams(p Params) Params {
 	p.TPJoin, p.BackOpen, p.PreCharge, p.PeekCD = 0, 0, 0, 0
 	p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 	p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
+	p.FFADrops = false
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2864,6 +2912,8 @@ func applyFlags(p *Params, spec string) {
 			p.HomeLOS = f
 		case "chargeengage":
 			p.ChargeEngage = f
+		case "ffadrops":
+			p.FFADrops = on
 		}
 	}
 }
@@ -2972,6 +3022,7 @@ func (b *Brain) safeFallback() {
 		p.LateR, p.HoldOut = 70, 0
 		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
+		p.FFADrops = false
 	}
 	off(&b.base)
 	b.regenOn = false
