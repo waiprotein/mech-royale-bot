@@ -185,7 +185,7 @@ func DefaultParams() Params {
 	// 60 s instead of 20 s, retreat stays allowed until the next circle is <= 25 m, and the end-game pile-up
 	// at the final centre is skipped until the zone forces the bot in.
 	p.PracAt = 20
-	p.BeamFFA = true
+	p.BeamFFA = false // practice-safe (S5 = 6.19) but -0.28 in the FFA sim (round 9); kept as a flag
 	p.LateR = 25
 	p.HoldOut = 368
 	p.HoldMin = 60
