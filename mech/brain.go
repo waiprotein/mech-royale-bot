@@ -19,6 +19,9 @@ type Track struct {
 	LOS     bool
 	Closing float64
 	Engage  bool
+	// CalmAt (hunthide): last time this mech was seen within 200 m with its aim more than 0.6 rad off us;
+	// reset to -100 when it is seen aiming at us (within 0.22 rad, giddy's "aimed" test).
+	CalmAt float64
 }
 
 type known struct {
@@ -204,6 +207,14 @@ type Params struct {
 	// laser_charge or lightning sound heard "near" or "mid" in the last 1.5 s, so we face (see, and take front
 	// armour from) the shooter first. "Unexplained" = no mech we see this tick within 0.35 rad of its bearing.
 	FaceSound bool
+	// HuntHide [hunthide]: EXPERIMENTAL. Acts only while squad params are on (pracOn: after PracAt, before the
+	// first death we did not cause), which in an FFA is the window where every giddy copy hunts. Squad params
+	// stay on, but squad engagements are additionally filtered through giddy's FFA ghost engage rule (within
+	// EngageDist 60 m, hit us in the last 4 s, charging a laser at us within 120 m, below 350 HP within 120 m,
+	// or 2 alive) ONLY IF at least 2 other mechs were seen within 200 m in the last 5 s with their aim not at
+	// us (Track.CalmAt). Heuristic: the practice house squad hunts us, FFA copies hunt each other.
+	// Risk: idle house-squad members that do not aim at us would also trigger it and change practice play.
+	HuntHide bool
 }
 
 func DefaultParams() Params {
@@ -313,13 +324,20 @@ func (b *Brain) observe(o *Obs) {
 		}
 		t := tab[m.ID]
 		if t == nil {
-			t = &Track{HitMe: -100}
+			t = &Track{HitMe: -100, CalmAt: -100}
 			tab[m.ID] = t
 		}
 		t.MechSeen = *m
 		t.Seen = now
 		dx, dy := m.Pos[0]-me.Pos[0], m.Pos[1]-me.Pos[1]
 		t.Dist = hyp(dx, dy)
+		if m.Kind == "mech" && t.Dist < 200 {
+			if off := math.Abs(angDiff(m.Aim[0], math.Atan2(-dy, -dx))); off > 0.6 {
+				t.CalmAt = now
+			} else if off < 0.22 {
+				t.CalmAt = -100
+			}
+		}
 		c := b.center(t)
 		t.LOS = b.W.Clear(muzzle, c)
 		if !t.LOS && m.Kind == "mech" {
@@ -606,6 +624,17 @@ func (b *Brain) step(o *Obs, act *Action) {
 	if b.P.HPw > 0 {
 		hpw = b.P.HPw
 	}
+	// hunthide: only while squad params are on (pracOn, so !Ghost), and only with 2+ calm mechs (see HuntHide).
+	huntHide := false
+	if b.P.HuntHide && b.pracOn && !b.P.Ghost {
+		calm := 0
+		for _, t := range b.tracks {
+			if now-t.CalmAt < 5 {
+				calm++
+			}
+		}
+		huntHide = calm >= 2
+	}
 	for _, t := range b.tracks {
 		if now-t.Seen > 2.5 {
 			continue
@@ -654,6 +683,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 			t.Engage = true
 		case aimed && t.Dist < 190:
 			t.Engage = true
+		}
+		if huntHide && t.Engage && !(t.Dist < b.P.EngageDist || now-t.HitMe < 4 || (aimed && t.Charging && t.Dist < 120) ||
+			(t.HP < 350 && t.Dist < 120) || o.Alive <= 2) {
+			t.Engage = false // squad engagement that giddy's FFA ghost rule would not take
 		}
 		if t.Engage && !t.LOS && t.Dist < maxT && (hidden == nil || t.Dist < hidden.Dist) {
 			hidden = t
@@ -2304,6 +2337,8 @@ func applyFlags(p *Params, spec string) {
 			p.DuelFlee = f
 		case "facesound":
 			p.FaceSound = on
+		case "hunthide":
+			p.HuntHide = on
 		}
 	}
 }
