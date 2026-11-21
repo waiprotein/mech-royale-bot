@@ -19,6 +19,9 @@ type Track struct {
 	LOS     bool
 	Closing float64
 	Engage  bool
+	// CalmAt (hunthide): last time this mech was seen within 200 m with its aim more than 0.6 rad off us;
+	// reset to -100 when it is seen aiming at us (within 0.22 rad, giddy's "aimed" test).
+	CalmAt float64
 }
 
 type known struct {
@@ -100,6 +103,8 @@ type Brain struct {
 	stickID            int
 	stickAt, loseAt    float64
 	myHitAt            map[int]float64
+	// facesound: time (match s) and bearing of the newest unexplained weapon sound.
+	soundAt, soundBearing float64
 }
 
 type Params struct {
@@ -172,6 +177,51 @@ type Params struct {
 	// BeamFFA: treat a laser/lightning shot from one mech landing on another mech (not us) that lost HP as proof
 	// of a free-for-all (the practice squad never fights itself), and leave practice mode at once.
 	BeamFFA bool
+
+	// FFA experiments for the local sim. Every one is off by default (DefaultParams plays exactly as before);
+	// the MECH_FLAGS key is in brackets.
+	//
+	// OpenUntil [openuntil]: match time after which giddy's Opening switch [opening] turns off, even if no
+	// death we did not cause has happened yet (0 = no time cap, giddy's behaviour).
+	OpenUntil float64
+	// GunOnlyOut [gunonlyout]: while we hold only the gun, any visible mech holding a laser or lightning makes
+	// us `outgunned` at any range and HP (giddy: only a laser target beyond 55 m with us below 80% HP), which
+	// sends us down the existing swamped -> retreat -> cover path. Not mode-gated, but inert under squad params
+	// because their LoseRule overwrites the retreat flag every tick.
+	GunOnlyOut bool
+	// LateAlive [lateal]: the `alive <= N` half of `late` (no retreat, no shy/evade/hurt-cover in the end game).
+	// giddy: 3. 0 disables it, so retreat stays allowed with 3 or fewer alive (the LateR half still applies).
+	// squadParams resets it to 3, so practice play is unchanged.
+	LateAlive int
+	// LightLOS [lightlos]: FFA-only (gated on !pracOn: base params, i.e. before PracAt or after the FFA latch).
+	// When lightning is our only second weapon and the foe (the target, or the hidden foe we would peek)
+	// holds a laser beyond lightning range + 5 m, take the swamped -> retreat -> cover path (break LOS)
+	// instead of trading gun fire, unless we are finishing it.
+	LightLOS bool
+	// DuelFlee [duelflee]: FFA-only (!pracOn). If duelOdds (the duel model refitted on recorded top-16
+	// showdowns) for the current target is below this, flee for 5 s through OddsFlee's plumbing
+	// (oddsFleeUntil -> swamped -> retreat -> cover), unless we are finishing it. 0 = off.
+	DuelFlee float64
+	// FaceSound [facesound]: FFA-only (!pracOn). With no target, no engaged/hit-us mech to watch, no recent
+	// damage bearing and nothing being farmed, turn the torso (yaw) toward the newest unexplained gun, laser,
+	// laser_charge or lightning sound heard "near" or "mid" in the last 1.5 s, so we face (see, and take front
+	// armour from) the shooter first. "Unexplained" = no mech we see this tick within 0.35 rad of its bearing.
+	FaceSound bool
+	// HuntHide [hunthide]: EXPERIMENTAL. Acts only while squad params are on (pracOn: after PracAt, before the
+	// first death we did not cause), which in an FFA is the window where every giddy copy hunts. Squad params
+	// stay on, but squad engagements are additionally filtered through giddy's FFA ghost engage rule (within
+	// EngageDist 60 m, hit us in the last 4 s, charging a laser at us within 120 m, below 350 HP within 120 m,
+	// or 2 alive) ONLY IF at least 2 other mechs were seen within 200 m in the last 5 s with their aim not at
+	// us (Track.CalmAt). Heuristic: the practice house squad hunts us, FFA copies hunt each other.
+	// Risk: idle house-squad members that do not aim at us would also trigger it and change practice play.
+	HuntHide bool
+	// KeepLaser [keeplaser]: not mode-gated. giddy's LaserFirst (on in both modes) already ranks laser over
+	// lightning in wantPickup, so a held laser is never swapped for lightning and a laser is wanted over held
+	// lightning. KeepLaser adds what is missing: that ranking even with LaserFirst off, and, while we hold
+	// lightning, a laser pickup within loot reach (LootRadius, or LaserSeek if larger) is valued 150 (giddy:
+	// 60, below a cube's 75) in chooseLoot, so we go and swap it in. No effect under squad params (LaserSeek
+	// 240 already values it 150).
+	KeepLaser bool
 }
 
 func DefaultParams() Params {
@@ -189,6 +239,7 @@ func DefaultParams() Params {
 	p.LateR = 25
 	p.HoldOut = 368
 	p.HoldMin = 60
+	p.LateAlive = 3
 
 	return p
 }
@@ -207,7 +258,7 @@ func NewBrain(h *Hello, w *World) *Brain {
 		W: w, Cfg: h.Config, Slot: h.Slot, rng: rand.New(rand.NewSource(seed)), P: p,
 		tracks: map[int]*Track{}, npcs: map[int]*Track{}, crates: map[int]*known{}, cubes: map[int]*known{},
 		pickups: map[int]*known{}, bad: map[int]float64{}, strafe: 1, lootID: -1, lastHurt: -100, lastThreatAt: -100,
-		holdStart: -1,
+		holdStart: -1, soundAt: -100,
 	}
 }
 
@@ -280,13 +331,20 @@ func (b *Brain) observe(o *Obs) {
 		}
 		t := tab[m.ID]
 		if t == nil {
-			t = &Track{HitMe: -100}
+			t = &Track{HitMe: -100, CalmAt: -100}
 			tab[m.ID] = t
 		}
 		t.MechSeen = *m
 		t.Seen = now
 		dx, dy := m.Pos[0]-me.Pos[0], m.Pos[1]-me.Pos[1]
 		t.Dist = hyp(dx, dy)
+		if m.Kind == "mech" && t.Dist < 200 {
+			if off := math.Abs(angDiff(m.Aim[0], math.Atan2(-dy, -dx))); off > 0.6 {
+				t.CalmAt = now
+			} else if off < 0.22 {
+				t.CalmAt = -100
+			}
+		}
 		c := b.center(t)
 		t.LOS = b.W.Clear(muzzle, c)
 		if !t.LOS && m.Kind == "mech" {
@@ -382,7 +440,11 @@ func (b *Brain) observe(o *Obs) {
 			b.P = squadParams(b.base)
 		}
 	}
-	if open := b.base.Opening && !b.notPractice && !b.pracOn && b.startAlive-o.Alive-b.kills <= 0; open != b.openOn {
+	// Opening (giddy, dormant): while no death we did not cause has happened, FFA is not latched and squad
+	// params are not on (so in practice only before PracAt), play laser-first with LaserSeek 240 and
+	// LootRadius 150, and walk home at full speed (see the openOn check in step). OpenUntil caps it by time.
+	if open := b.base.Opening && !b.notPractice && !b.pracOn && b.startAlive-o.Alive-b.kills <= 0 &&
+		(b.base.OpenUntil <= 0 || now < b.base.OpenUntil); open != b.openOn {
 		b.openOn = open
 		b.P = b.base
 		if open {
@@ -557,7 +619,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 	if b.P.LateR > 0 {
 		lateR = b.P.LateR
 	}
-	late := z.NextRadius <= lateR || o.Alive <= 3
+	late := z.NextRadius <= lateR || o.Alive <= b.P.LateAlive
 
 	var seen []*Track
 	var target, hidden, shy *Track
@@ -568,6 +630,17 @@ func (b *Brain) step(o *Obs, act *Action) {
 	}
 	if b.P.HPw > 0 {
 		hpw = b.P.HPw
+	}
+	// hunthide: only while squad params are on (pracOn, so !Ghost), and only with 2+ calm mechs (see HuntHide).
+	huntHide := false
+	if b.P.HuntHide && b.pracOn && !b.P.Ghost {
+		calm := 0
+		for _, t := range b.tracks {
+			if now-t.CalmAt < 5 {
+				calm++
+			}
+		}
+		huntHide = calm >= 2
 	}
 	for _, t := range b.tracks {
 		if now-t.Seen > 2.5 {
@@ -617,6 +690,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 			t.Engage = true
 		case aimed && t.Dist < 190:
 			t.Engage = true
+		}
+		if huntHide && t.Engage && !(t.Dist < b.P.EngageDist || now-t.HitMe < 4 || (aimed && t.Charging && t.Dist < 120) ||
+			(t.HP < 350 && t.Dist < 120) || o.Alive <= 2) {
+			t.Engage = false // squad engagement that giddy's FFA ghost rule would not take
 		}
 		if t.Engage && !t.LOS && t.Dist < maxT && (hidden == nil || t.Dist < hidden.Dist) {
 			hidden = t
@@ -671,11 +748,31 @@ func (b *Brain) step(o *Obs, act *Action) {
 	finishing := target != nil && target.Dist < 120 && (target.HP < 200 || target.HP < me.HP*0.5)
 	_, myLaser := hasWeapon(me.Weapons, "laser")
 	outgunned := target != nil && holds(target.Weapons, "laser") && myLaser == nil && target.Dist > 55 && hpFrac < 0.8
+	if b.P.GunOnlyOut && gun != nil && light == nil && laser == nil {
+		if _, mortar := hasWeapon(me.Weapons, "mortar"); mortar == nil {
+			for _, t := range seen {
+				if t.Seen == now && (holds(t.Weapons, "laser") || holds(t.Weapons, "lightning")) {
+					outgunned = true
+					break
+				}
+			}
+		}
+	}
 	swamped := b.P.CrowdHide && (crowd >= 3 || (crowd == 2 && hpFrac < 0.65) || outgunned)
 	if b.P.OddsFlee > 0 && target != nil && !finishing && b.odds(me, target, now, false) < b.P.OddsFlee {
 		b.oddsFleeUntil = now + 5
 	}
+	// duelflee: FFA-only (!pracOn); same flee latch as OddsFlee.
+	if b.P.DuelFlee > 0 && !b.pracOn && target != nil && !finishing && b.duelOdds(me, target) < b.P.DuelFlee {
+		b.oddsFleeUntil = now + 5
+	}
 	if now < b.oddsFleeUntil && !finishing {
+		swamped = true
+	}
+	// lightlos: FFA-only (!pracOn). foe = target, else the hidden foe Peek would step out to; using it keeps us
+	// from peeking back into a laser's line once we have broken it.
+	if b.P.LightLOS && !b.pracOn && light != nil && laser == nil && foe != nil && !finishing &&
+		holds(foe.Weapons, "laser") && foe.Dist > light.Stats.Range+5 {
 		swamped = true
 	}
 	if !b.retreat && ((hpFrac < b.P.RetreatHP && now-b.lastThreatAt < 2) || swamped) {
@@ -1112,6 +1209,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		}
 	}
 
+	if b.P.FaceSound {
+		b.hearShots(o)
+	}
 	if !haveAim {
 
 		var watch *Track
@@ -1129,6 +1229,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 			aim[0] = b.npcBearing
 		case now-b.lastHurt < 2.5:
 			aim[0] = b.hurtBearing
+		case b.P.FaceSound && !b.pracOn && target == nil && farm == nil && farmPos == nil && now-b.soundAt < 1.5:
+			// facesound: FFA-only (!pracOn); below watch/npc/hurt bearings, above the walking scan.
+			aim[0] = b.soundBearing
 		case mx != 0 || my != 0:
 			aim[0] = math.Atan2(my, mx) + 1.15*math.Sin(now*1.3)
 		default:
@@ -1233,7 +1336,7 @@ func (b *Brain) wantPickup(me *Self, kind string) bool {
 		return false
 	}
 	rank := func(k string) int {
-		if b.P.LaserFirst && k == "laser" {
+		if (b.P.LaserFirst || b.P.KeepLaser) && k == "laser" {
 			return 4
 		}
 		return weaponRank[k]
@@ -1768,6 +1871,11 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 			if seek {
 				v = math.Max(v, 150)
 			}
+			if b.P.KeepLaser && p.Kind == "laser" {
+				if _, l := hasWeapon(me.Weapons, "lightning"); l != nil {
+					v = math.Max(v, 150) // keeplaser: swap held lightning for a laser in reach
+				}
+			}
 			consider("pickup", p.ID, p.Pos, v)
 		}
 	}
@@ -1999,6 +2107,55 @@ func (b *Brain) odds(me *Self, t *Track, now float64, opening bool) float64 {
 	return 1 / (1 + math.Exp(-z))
 }
 
+// hearShots (facesound) remembers the newest gun / laser / laser_charge / lightning sound heard near or mid
+// (< 160 m) that no mech we can see this tick explains (none within 0.35 rad, about 3 sigma of the 7 degree
+// bearing noise). NPC shots are a separate kind (npc_gun) and our own sounds are never reported.
+func (b *Brain) hearShots(o *Obs) {
+	me := &o.Self
+	for _, s := range o.Sounds {
+		switch s.Kind {
+		case "gun", "laser", "laser_charge", "lightning":
+		default:
+			continue
+		}
+		if s.Dist != "near" && s.Dist != "mid" {
+			continue
+		}
+		at := o.T - s.Age
+		if at < b.soundAt {
+			continue
+		}
+		explained := false
+		for i := range o.Mechs {
+			m := &o.Mechs[i]
+			if m.Kind == "mech" && math.Abs(angDiff(math.Atan2(m.Pos[1]-me.Pos[1], m.Pos[0]-me.Pos[0]), s.Bearing)) < 0.35 {
+				explained = true
+				break
+			}
+		}
+		if !explained {
+			b.soundAt, b.soundBearing = at, s.Bearing
+		}
+	}
+}
+
+// duelOdds is the chance that we win a duel against t, from the logistic refit on 129 decisive engagements
+// in recorded top-16 showdowns (vault: Data/Showdown analysis.md, Sat 21:40 GMT): +2.3 per unit of ln(HP
+// ratio), +0.8 per 10 cubes (each side capped at 10), -0.8 when t holds a laser, +0.5 when t's back is
+// turned to us. There is no intercept, so equal HP and kit gives 0.5. Used only by DuelFlee.
+func (b *Brain) duelOdds(me *Self, t *Track) float64 {
+	capc := func(c int) float64 { return math.Min(float64(c), 10) }
+	z := 2.3*math.Log(math.Max(me.HP, 1)/math.Max(t.HP, 1)) + 0.08*(capc(me.Cubes)-capc(t.Cubes))
+	if holds(t.Weapons, "laser") {
+		z -= 0.8
+	}
+	toMe := math.Atan2(me.Pos[1]-t.Pos[1], me.Pos[0]-t.Pos[0])
+	if math.Abs(angDiff(t.Aim[0], toMe)) > math.Pi/2 {
+		z += 0.5
+	}
+	return 1 / (1 + math.Exp(-z))
+}
+
 func squadParams(p Params) Params {
 	p.Ghost = false
 	p.Peek = false
@@ -2033,6 +2190,7 @@ func squadParams(p Params) Params {
 	// Keep practice exactly as giddy tuned it: our FFA end-game changes stay off.
 	p.LateR = 70
 	p.HoldOut = 0
+	p.LateAlive = 3
 
 	return p
 }
@@ -2177,6 +2335,24 @@ func applyFlags(p *Params, spec string) {
 			p.DodgeBoost = f
 		case "threatboost":
 			p.ThreatBoost = f
+		case "opening":
+			p.Opening = on
+		case "openuntil":
+			p.OpenUntil = f
+		case "gunonlyout":
+			p.GunOnlyOut = on
+		case "lateal":
+			p.LateAlive = int(f)
+		case "lightlos":
+			p.LightLOS = on
+		case "duelflee":
+			p.DuelFlee = f
+		case "facesound":
+			p.FaceSound = on
+		case "hunthide":
+			p.HuntHide = on
+		case "keeplaser":
+			p.KeepLaser = on
 		}
 	}
 }
