@@ -179,6 +179,11 @@ type Params struct {
 	// OpenUntil [openuntil]: match time after which giddy's Opening switch [opening] turns off, even if no
 	// death we did not cause has happened yet (0 = no time cap, giddy's behaviour).
 	OpenUntil float64
+	// GunOnlyOut [gunonlyout]: while we hold only the gun, any visible mech holding a laser or lightning makes
+	// us `outgunned` at any range and HP (giddy: only a laser target beyond 55 m with us below 80% HP), which
+	// sends us down the existing swamped -> retreat -> cover path. Not mode-gated, but inert under squad params
+	// because their LoseRule overwrites the retreat flag every tick.
+	GunOnlyOut bool
 }
 
 func DefaultParams() Params {
@@ -682,6 +687,16 @@ func (b *Brain) step(o *Obs, act *Action) {
 	finishing := target != nil && target.Dist < 120 && (target.HP < 200 || target.HP < me.HP*0.5)
 	_, myLaser := hasWeapon(me.Weapons, "laser")
 	outgunned := target != nil && holds(target.Weapons, "laser") && myLaser == nil && target.Dist > 55 && hpFrac < 0.8
+	if b.P.GunOnlyOut && gun != nil && light == nil && laser == nil {
+		if _, mortar := hasWeapon(me.Weapons, "mortar"); mortar == nil {
+			for _, t := range seen {
+				if t.Seen == now && (holds(t.Weapons, "laser") || holds(t.Weapons, "lightning")) {
+					outgunned = true
+					break
+				}
+			}
+		}
+	}
 	swamped := b.P.CrowdHide && (crowd >= 3 || (crowd == 2 && hpFrac < 0.65) || outgunned)
 	if b.P.OddsFlee > 0 && target != nil && !finishing && b.odds(me, target, now, false) < b.P.OddsFlee {
 		b.oddsFleeUntil = now + 5
@@ -2192,6 +2207,8 @@ func applyFlags(p *Params, spec string) {
 			p.Opening = on
 		case "openuntil":
 			p.OpenUntil = f
+		case "gunonlyout":
+			p.GunOnlyOut = on
 		}
 	}
 }
