@@ -180,7 +180,7 @@ func DefaultParams() Params {
 	// Our FFA changes (local league, see the vault's experiment note): giddy's practice params switch on at
 	// 60 s instead of 20 s, retreat stays allowed until the next circle is <= 25 m, and the end-game pile-up
 	// at the final centre is skipped until the zone forces the bot in.
-	p.PracAt = 60
+	p.PracAt = 40
 	p.LateR = 25
 	p.HoldOut = 368
 	p.HoldMin = 60
