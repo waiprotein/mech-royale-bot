@@ -3,7 +3,10 @@ package mech
 import (
 	"math"
 	"math/rand"
+	"os"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 const lat = 0.075
@@ -146,6 +149,12 @@ type Params struct {
 	FinishHP   float64
 	FinishRush bool
 	Pursue     float64
+	// Our additions (FFA end game). LateR: next-circle radius at or below which the bot stops retreating
+	// (giddy: 70). HoldOut: match time until which, once the next circle is the final one (<= 30 m), a ghost
+	// waits at a hidden spot at least HoldMin m from the final centre instead of walking into the pile-up.
+	LateR   float64
+	HoldOut float64
+	HoldMin float64
 }
 
 func DefaultParams() Params {
@@ -163,8 +172,10 @@ func NewBrain(h *Hello, w *World) *Brain {
 	if seed == 0 {
 		seed = int64(h.Slot) + 1
 	}
+	p := DefaultParams()
+	applyFlags(&p, os.Getenv("MECH_FLAGS"))
 	return &Brain{
-		W: w, Cfg: h.Config, Slot: h.Slot, rng: rand.New(rand.NewSource(seed)), P: DefaultParams(),
+		W: w, Cfg: h.Config, Slot: h.Slot, rng: rand.New(rand.NewSource(seed)), P: p,
 		tracks: map[int]*Track{}, npcs: map[int]*Track{}, crates: map[int]*known{}, cubes: map[int]*known{},
 		pickups: map[int]*known{}, bad: map[int]float64{}, strafe: 1, lootID: -1, lastHurt: -100, lastThreatAt: -100,
 		holdStart: -1,
@@ -495,7 +506,11 @@ func (b *Brain) step(o *Obs, act *Action) {
 	_, gun := hasWeapon(me.Weapons, "gun")
 	_, light := hasWeapon(me.Weapons, "lightning")
 	_, laser := hasWeapon(me.Weapons, "laser")
-	late := z.NextRadius <= 70 || o.Alive <= 3
+	lateR := 70.0
+	if b.P.LateR > 0 {
+		lateR = b.P.LateR
+	}
+	late := z.NextRadius <= lateR || o.Alive <= 3
 
 	var seen []*Track
 	var target, hidden, shy *Track
@@ -804,7 +819,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 					mx, my = 0, 0
 				}
 			}
-		} else if zdist > 3 && (!b.P.Ghost || z.NextRadius <= 30) {
+		} else if zdist > 3 && (!b.P.Ghost || (z.NextRadius <= 30 && !b.holdingOut(z, o.Alive))) {
 			mx, my = b.travel(me, zgx, zgy)
 			mode = "zone-walk"
 		} else if b.P.Ghost {
@@ -1782,6 +1797,9 @@ func (b *Brain) homeCost(o *Obs, px, py float64) float64 {
 
 func (b *Brain) home(o *Obs) (float64, float64, bool) {
 	z := &o.Zone
+	if b.holdingOut(z, o.Alive) {
+		return b.holdHome(o)
+	}
 	out := !b.homeSet || hyp(b.homeXY[0]-z.NextCenter[0], b.homeXY[1]-z.NextCenter[1]) > z.NextRadius*0.8
 	if out || b.now-b.homeAt > 12 {
 		b.homeAt = b.now
@@ -1936,6 +1954,10 @@ func squadParams(p Params) Params {
 	p.Finish = 20
 	p.Finish = 26
 
+	// Keep practice exactly as giddy tuned it: our FFA end-game changes stay off.
+	p.LateR = 70
+	p.HoldOut = 0
+
 	return p
 }
 
@@ -1945,4 +1967,101 @@ func (b *Brain) cubeCap() int {
 		c = g
 	}
 	return c
+}
+
+// holdingOut reports whether a ghost should stay away from the final circle's centre for now.
+func (b *Brain) holdingOut(z *Zone, alive int) bool {
+	return b.P.Ghost && b.P.HoldOut > 0 && b.now < b.P.HoldOut && z.NextRadius <= 30 && alive > 2
+}
+
+// holdHome picks a hidden spot inside the current circle, between HoldMin and HoldMin+25 m from the final
+// centre. The normal zone deadline logic (zoneMust) still pulls the bot in before the circle reaches it.
+func (b *Brain) holdHome(o *Obs) (float64, float64, bool) {
+	z := &o.Zone
+	c := b.curZone(z)
+	minD := b.P.HoldMin
+	if minD <= 0 {
+		minD = 40
+	}
+	valid := func(px, py float64) bool {
+		d := hyp(px-z.NextCenter[0], py-z.NextCenter[1])
+		return d >= minD*0.8 && hyp(px-c.X, py-c.Y) <= c.R-12
+	}
+	if !b.homeSet || !valid(b.homeXY[0], b.homeXY[1]) || b.now-b.homeAt > 12 {
+		b.homeAt = b.now
+		best, bestC := [2]float64{}, math.Inf(1)
+		for k := 0; k < 48; k++ {
+			a := b.rng.Float64() * 2 * math.Pi
+			r := minD + b.rng.Float64()*25
+			px, py := z.NextCenter[0]+math.Cos(a)*r, z.NextCenter[1]+math.Sin(a)*r
+			if !valid(px, py) || !b.W.InBounds(px, py) || !b.W.Reachable(px, py) {
+				continue
+			}
+			if cst := b.homeCost(o, px, py) + 0.5*r; cst < bestC {
+				best, bestC = [2]float64{px, py}, cst
+			}
+		}
+		if math.IsInf(bestC, 1) {
+			// No valid spot (circle too small): fall back to giddy's behaviour.
+			return z.NextCenter[0], z.NextCenter[1], true
+		}
+		if !b.homeSet || !valid(b.homeXY[0], b.homeXY[1]) || bestC < b.homeCost(o, b.homeXY[0], b.homeXY[1])+0.5*hyp(b.homeXY[0]-z.NextCenter[0], b.homeXY[1]-z.NextCenter[1])-15 {
+			b.homeXY, b.homeSet = best, true
+		}
+	}
+	return b.homeXY[0], b.homeXY[1], b.homeSet
+}
+
+// applyFlags overrides parameters from a "key=value,key=value" string (env MECH_FLAGS). It is only used
+// by local experiments; with the variable unset the bot runs DefaultParams unchanged. Booleans take 0/1.
+func applyFlags(p *Params, spec string) {
+	for _, kv := range strings.Split(spec, ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(kv), "=")
+		if !ok {
+			continue
+		}
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			continue
+		}
+		on := f != 0
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "later":
+			p.LateR = f
+		case "holdout":
+			p.HoldOut = f
+		case "holdmin":
+			p.HoldMin = f
+		case "lethal":
+			p.Lethal = on
+		case "nanoup":
+			p.NanoUp = on
+		case "laserup":
+			p.LaserUp = on
+		case "vulture":
+			p.Vulture = f
+		case "ambush":
+			p.Ambush = f
+		case "odds":
+			p.Odds = f
+		case "oddsflee":
+			p.OddsFlee = f
+		case "engage":
+			p.EngageDist = f
+		case "retreat":
+			p.RetreatHP = f
+		case "recover":
+			p.RecoverHP = f
+		case "crateuntil":
+			p.CrateUntil = f
+		case "lootradius":
+			p.LootRadius = f
+		case "usedrops":
+			p.UseDrops = on
+		case "practice":
+			p.Practice = on
+		case "laserfirst":
+			p.LaserFirst = on
+		}
+	}
 }
