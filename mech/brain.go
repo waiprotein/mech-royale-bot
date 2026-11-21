@@ -121,6 +121,9 @@ type Brain struct {
 	// peekcd (bit 2): id of the hidden foe whose laser we heard fire, and when its cooldown ends.
 	cdID    int
 	cdUntil float64
+	// regenhide: latched while regenerating in cover, and when the latch started.
+	regenOn bool
+	regenAt float64
 }
 
 type Params struct {
@@ -280,6 +283,12 @@ type Params struct {
 	// mech charging at us still sends us back into cover.
 	PreCharge float64
 	PeekCD    int
+	// RegenHide [regenhide]: FFA-only (ffaOn). Below this HP share with no target or foe (and not late), latch
+	// regen-hide: coverMove from every mech seen in the last 20 s (giddy's cover uses only the last 2.5 s), stand
+	// still once hidden, and skip crate farming and the loot choice (dealing damage restarts the 5 s regen
+	// delay). Released at 90% HP, after 30 s, when late or when ffaOn drops; a foe or a zoneShould move takes
+	// precedence while it holds. 0 = off.
+	RegenHide float64
 }
 
 func DefaultParams() Params {
@@ -901,6 +910,14 @@ func (b *Brain) step(o *Obs, act *Action) {
 		}
 		b.retreat = now-b.loseAt < 1.5 && b.loseAt > 0
 	}
+	// regenhide: FFA-only. Latch below RegenHide with no target/foe; release at 90% HP, after 30 s, when late or
+	// when FFA play stops (see RegenHide).
+	if b.P.RegenHide > 0 && ffaOn && !late && !b.regenOn && hpFrac < b.P.RegenHide && foe == nil {
+		b.regenOn, b.regenAt = true, now
+	}
+	if b.regenOn && (b.P.RegenHide <= 0 || !ffaOn || late || hpFrac >= 0.9 || now-b.regenAt > 30) {
+		b.regenOn = false
+	}
 
 	exposed := false
 	for _, t := range seen {
@@ -963,6 +980,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 	case target == nil && now-b.lastHurt < 2.5 && !late && b.P.Ghost && b.hideFromBearing(o, seen, &mx, &my):
 		boost = me.Energy > 30 && (mx != 0 || my != 0)
 		mode = "cover"
+	case b.regenOn && foe == nil && !(zoneShould && zdist > 2) && b.coverMove(o, b.recentMechs(x, y, 20), &mx, &my):
+		// regenhide: walk (no boost) into cover from every mech seen in the last 20 s; coverMove stands still
+		// once hidden. With no such mech within 230 m (or no cover) we fall through to home, without loot.
+		mode = "regen"
 	case now < b.P.EarlyHide && exposed && !finishing && b.coverMove(o, seen, &mx, &my):
 		boost = me.Energy > 20 && (mx != 0 || my != 0)
 		mode = "earlyhide"
@@ -1054,7 +1075,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 		mx, my = b.travel(me, zgx, zgy)
 		mode = "zone"
 	default:
-		lc := b.chooseLoot(o, hpFrac, danger)
+		var lc *lootChoice
+		if !b.regenOn { // regenhide: no loot run (crate/NPC hits restart the regen delay) while regenerating
+			lc = b.chooseLoot(o, hpFrac, danger)
+		}
 		if lc != nil {
 			mode = "loot:" + lc.kind
 			switch lc.kind {
@@ -1168,7 +1192,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 			farm, farmPos, defend = worst, nil, true
 		}
 	}
-	if b.P.Econ && target == nil && farm == nil && farmPos == nil && gun != nil && !b.retreat {
+	if b.P.Econ && target == nil && farm == nil && farmPos == nil && gun != nil && !b.retreat && !b.regenOn { // regenhide: no crates
 
 		reach := 110.0
 		for _, t := range b.tracks {
@@ -2147,6 +2171,25 @@ func (b *Brain) hideFromBearing(o *Obs, seen []*Track, mx, my *float64) bool {
 	return b.coverMove(o, append([]*Track{ghost}, seen...), mx, my)
 }
 
+// recentMechs returns the mech tracks seen within the last s seconds (at their current or last known
+// position), nearest to (x, y) first, ties by id so the order never depends on map iteration (regenhide).
+func (b *Brain) recentMechs(x, y, s float64) []*Track {
+	var out []*Track
+	for _, t := range b.tracks {
+		if b.now-t.Seen <= s {
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		di, dj := hyp(out[i].Pos[0]-x, out[i].Pos[1]-y), hyp(out[j].Pos[0]-x, out[j].Pos[1]-y)
+		if di != dj {
+			return di < dj
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
 func (b *Brain) dodge(o *Obs) (dx, dy float64, laser bool) {
 	me := &o.Self
 	cx, cy, cz := me.Pos[0], me.Pos[1], me.Pos[2]+me.Stats.Height*0.56
@@ -2377,6 +2420,7 @@ func squadParams(p Params) Params {
 	// Keep practice exactly as giddy tuned it: our FFA changes stay off.
 	p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp = 0, 0, 0, false
 	p.TPJoin, p.BackOpen, p.PreCharge, p.PeekCD = 0, 0, 0, 0
+	p.RegenHide = 0
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2605,6 +2649,8 @@ func applyFlags(p *Params, spec string) {
 			p.PreCharge = f
 		case "peekcd":
 			p.PeekCD = int(f)
+		case "regenhide":
+			p.RegenHide = f
 		}
 	}
 }
@@ -2711,8 +2757,10 @@ func (b *Brain) safeFallback() {
 		p.CrowdR, p.HomeFrac, p.GunOnlyR, p.LateAlive = 0, 0, 0, 3
 		p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp, p.Vulture = 0, 0, 0, false, 0
 		p.LateR, p.HoldOut = 70, 0
+		p.RegenHide = 0
 	}
 	off(&b.base)
+	b.regenOn = false
 	if b.pracOn {
 		b.P = squadParams(b.base)
 	} else {
