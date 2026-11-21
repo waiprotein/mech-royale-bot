@@ -100,6 +100,8 @@ type Brain struct {
 	stickID            int
 	stickAt, loseAt    float64
 	myHitAt            map[int]float64
+	// facesound: time (match s) and bearing of the newest unexplained weapon sound.
+	soundAt, soundBearing float64
 }
 
 type Params struct {
@@ -197,6 +199,11 @@ type Params struct {
 	// showdowns) for the current target is below this, flee for 5 s through OddsFlee's plumbing
 	// (oddsFleeUntil -> swamped -> retreat -> cover), unless we are finishing it. 0 = off.
 	DuelFlee float64
+	// FaceSound [facesound]: FFA-only (!pracOn). With no target, no engaged/hit-us mech to watch, no recent
+	// damage bearing and nothing being farmed, turn the torso (yaw) toward the newest unexplained gun, laser,
+	// laser_charge or lightning sound heard "near" or "mid" in the last 1.5 s, so we face (see, and take front
+	// armour from) the shooter first. "Unexplained" = no mech we see this tick within 0.35 rad of its bearing.
+	FaceSound bool
 }
 
 func DefaultParams() Params {
@@ -233,7 +240,7 @@ func NewBrain(h *Hello, w *World) *Brain {
 		W: w, Cfg: h.Config, Slot: h.Slot, rng: rand.New(rand.NewSource(seed)), P: p,
 		tracks: map[int]*Track{}, npcs: map[int]*Track{}, crates: map[int]*known{}, cubes: map[int]*known{},
 		pickups: map[int]*known{}, bad: map[int]float64{}, strafe: 1, lootID: -1, lastHurt: -100, lastThreatAt: -100,
-		holdStart: -1,
+		holdStart: -1, soundAt: -100,
 	}
 }
 
@@ -1162,6 +1169,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		}
 	}
 
+	if b.P.FaceSound {
+		b.hearShots(o)
+	}
 	if !haveAim {
 
 		var watch *Track
@@ -1179,6 +1189,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 			aim[0] = b.npcBearing
 		case now-b.lastHurt < 2.5:
 			aim[0] = b.hurtBearing
+		case b.P.FaceSound && !b.pracOn && target == nil && farm == nil && farmPos == nil && now-b.soundAt < 1.5:
+			// facesound: FFA-only (!pracOn); below watch/npc/hurt bearings, above the walking scan.
+			aim[0] = b.soundBearing
 		case mx != 0 || my != 0:
 			aim[0] = math.Atan2(my, mx) + 1.15*math.Sin(now*1.3)
 		default:
@@ -2049,6 +2062,38 @@ func (b *Brain) odds(me *Self, t *Track, now float64, opening bool) float64 {
 	return 1 / (1 + math.Exp(-z))
 }
 
+// hearShots (facesound) remembers the newest gun / laser / laser_charge / lightning sound heard near or mid
+// (< 160 m) that no mech we can see this tick explains (none within 0.35 rad, about 3 sigma of the 7 degree
+// bearing noise). NPC shots are a separate kind (npc_gun) and our own sounds are never reported.
+func (b *Brain) hearShots(o *Obs) {
+	me := &o.Self
+	for _, s := range o.Sounds {
+		switch s.Kind {
+		case "gun", "laser", "laser_charge", "lightning":
+		default:
+			continue
+		}
+		if s.Dist != "near" && s.Dist != "mid" {
+			continue
+		}
+		at := o.T - s.Age
+		if at < b.soundAt {
+			continue
+		}
+		explained := false
+		for i := range o.Mechs {
+			m := &o.Mechs[i]
+			if m.Kind == "mech" && math.Abs(angDiff(math.Atan2(m.Pos[1]-me.Pos[1], m.Pos[0]-me.Pos[0]), s.Bearing)) < 0.35 {
+				explained = true
+				break
+			}
+		}
+		if !explained {
+			b.soundAt, b.soundBearing = at, s.Bearing
+		}
+	}
+}
+
 // duelOdds is the chance that we win a duel against t, from the logistic fit on recorded top-16 showdowns
 // (vault: Data/Showdown analysis.md): +3.3 per unit of ln(HP ratio), +0.9 per 10 cubes (each side capped
 // at 10), -1.8 when t holds a laser and we do not, +1.8 the other way round. There is no intercept, so
@@ -2257,6 +2302,8 @@ func applyFlags(p *Params, spec string) {
 			p.LightLOS = on
 		case "duelflee":
 			p.DuelFlee = f
+		case "facesound":
+			p.FaceSound = on
 		}
 	}
 }
