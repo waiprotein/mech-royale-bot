@@ -22,6 +22,10 @@ type Track struct {
 	// CalmAt (hunthide): last time this mech was seen within 200 m with its aim more than 0.6 rad off us;
 	// reset to -100 when it is seen aiming at us (within 0.22 rad, giddy's "aimed" test).
 	CalmAt float64
+	// HurtAt (tpjoin): last time this mech lost more than 20 HP between two sightings <= 0.5 s apart with no hit
+	// of ours in between (someone else is hurting it). TPAt / OppDist (tpjoin): last time the third-party join
+	// rule held for it, and the distance from it to the opponent it was fighting then.
+	HurtAt, TPAt, OppDist float64
 }
 
 type known struct {
@@ -241,6 +245,13 @@ type Params struct {
 	// the strict FFA features act at once instead of after the first unexplained death.
 	CfgNoSquad bool
 	CfgFFA     bool
+	// TPJoin [tpjoin] / TPHP [tphp]: FFA-only (ffaOn). Third-party a busy mech: engage a visible mech that is
+	// fighting another mech (beam between them, mutual aim, or it is losing HP to someone else while one aims at
+	// the other; see tpOpp) and not us, when we are more than TPJoin m farther from it than its opponent, our HP
+	// share is >= TPHP (0 = 0.7), its HP <= ours and it is within our reach. prefRange then keeps us that far
+	// out, so its nearest-first targeting stays on the opponent. 0 = off; the value is the margin in m.
+	TPJoin float64
+	TPHP   float64
 }
 
 func DefaultParams() Params {
@@ -352,8 +363,14 @@ func (b *Brain) observe(o *Obs) {
 		}
 		t := tab[m.ID]
 		if t == nil {
-			t = &Track{HitMe: -100, CalmAt: -100}
+			t = &Track{HitMe: -100, CalmAt: -100, HurtAt: -100, TPAt: -100}
 			tab[m.ID] = t
+		}
+		if b.P.TPJoin > 0 && m.Kind == "mech" && now-t.Seen <= 0.5 && m.HP < t.HP-20 {
+			// tpjoin: it lost HP since our last sighting and none of our hits landed after that sighting.
+			if at, ok := b.myHitAt[m.ID]; !ok || at <= t.Seen {
+				t.HurtAt = now
+			}
 		}
 		t.MechSeen = *m
 		t.Seen = now
@@ -707,6 +724,21 @@ func (b *Brain) step(o *Obs, act *Action) {
 			}
 			if b.P.Odds > 0 && !t.Engage && t.LOS && hpFrac > 0.5 && t.Dist < b.reach(me) && b.odds(me, t, now, true) >= b.P.Odds {
 				t.Engage = true
+			}
+			// tpjoin: FFA-only. Join a fight it is having with another mech, from farther out than that mech.
+			if b.P.TPJoin > 0 && ffaOn {
+				tpHP := b.P.TPHP
+				if tpHP <= 0 {
+					tpHP = 0.7
+				}
+				if t.LOS && hpFrac >= tpHP && t.HP <= me.HP && t.Dist < b.reach(me) && off > 0.3 && now-t.HitMe > 4 {
+					if opp, od := b.tpOpp(o, t); opp != nil && t.Dist > od+b.P.TPJoin {
+						t.TPAt, t.OppDist = now, od
+					}
+				}
+				if now-t.TPAt < 1.5 { // short hold bridges aim-cone flicker while they strafe
+					t.Engage = true
+				}
 			}
 		case b.P.AllFoes && t.Dist < maxT:
 			t.Engage = true
@@ -1551,6 +1583,9 @@ func (b *Brain) prefRange(me *Self, t *Track) float64 {
 			r = math.Max(r, 80)
 		}
 	}
+	if b.P.TPJoin > 0 && b.ffaNow && b.now-t.TPAt < 1.5 {
+		r = math.Max(r, t.OppDist+b.P.TPJoin) // tpjoin: stay the farther attacker
+	}
 	return r
 }
 
@@ -2203,6 +2238,38 @@ func (b *Brain) duelOdds(me *Self, t *Track) float64 {
 	return sig(0.94 + 4.0*math.Log(hpMe/hpThem) + 0.74*ind(meLaser) - 1.19*ind(themLaser) + 0.68*ind(themBack))
 }
 
+// tpOpp (tpjoin) returns the mech t is fighting and its distance to t: the nearest other mech seen this tick
+// within 230 m of t that traded a beam with t this tick, or that t aims at / that aims at t (0.25 rad), where
+// the aim counts only if it is mutual or t lost HP to someone else in the last 2 s. Never us (not a track).
+func (b *Brain) tpOpp(o *Obs, t *Track) (*Track, float64) {
+	var opp *Track
+	od := 230.0
+	for _, u := range b.tracks {
+		if u == t || u.Seen != b.now {
+			continue
+		}
+		d := hyp(u.Pos[0]-t.Pos[0], u.Pos[1]-t.Pos[1])
+		if d >= od {
+			continue
+		}
+		tAims := math.Abs(angDiff(t.Aim[0], math.Atan2(u.Pos[1]-t.Pos[1], u.Pos[0]-t.Pos[0]))) < 0.25
+		uAims := math.Abs(angDiff(u.Aim[0], math.Atan2(t.Pos[1]-u.Pos[1], t.Pos[0]-u.Pos[0]))) < 0.25
+		beam := false
+		for _, bm := range o.Beams {
+			for k := 1; k < len(bm.Path); k++ {
+				p := bm.Path[k]
+				if (bm.By == u.ID && hyp(p[0]-t.Pos[0], p[1]-t.Pos[1]) < 4) || (bm.By == t.ID && hyp(p[0]-u.Pos[0], p[1]-u.Pos[1]) < 4) {
+					beam = true
+				}
+			}
+		}
+		if beam || (tAims && uAims) || ((tAims || uAims) && b.now-t.HurtAt < 2) {
+			opp, od = u, d
+		}
+	}
+	return opp, od
+}
+
 func squadParams(p Params) Params {
 	p.Ghost = false
 	p.Peek = false
@@ -2236,6 +2303,7 @@ func squadParams(p Params) Params {
 	}
 	// Keep practice exactly as giddy tuned it: our FFA changes stay off.
 	p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp = 0, 0, 0, false
+	p.TPJoin = 0
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2413,6 +2481,10 @@ func applyFlags(p *Params, spec string) {
 			p.FFAStrict = on
 		case "keeplaser":
 			p.KeepLaser = on
+		case "tpjoin":
+			p.TPJoin = f
+		case "tphp":
+			p.TPHP = f
 		}
 	}
 }
