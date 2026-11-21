@@ -305,6 +305,12 @@ type Params struct {
 	// static exposure term is unchanged. home/holdHome re-choose at once (not on the 12 s timer) when a mech seen
 	// this tick gains sight of the current home. At most 4 LOS checks per candidate. 0 = off.
 	HomeLOS float64
+	// ChargeEngage [chargeengage]: FFA-only (ffaOn). A visible mech charging a laser with its aim within 0.15 rad of
+	// us is engaged out to this range (giddy: within 0.22 rad, to 120 m; only mechs giddy's rule leaves out are
+	// added). If our laser is hot (within 0.3 s of full, in range) and it is in line of sight, the fight branch
+	// fires when on target; otherwise we break its line with coverMove (boost, no new laser charge so we keep
+	// full speed), unless we are finishing a target. 0 = off.
+	ChargeEngage float64
 }
 
 func DefaultParams() Params {
@@ -730,6 +736,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 
 	var seen []*Track
 	var target, hidden, shy *Track
+	var chargeFoe *Track // chargeengage: nearest long-range charger engaged only by that flag
 	bestScore := math.Inf(1)
 	maxT, hpw := 215.0, 60.0/1400
 	if b.P.MaxTarget > 0 {
@@ -769,6 +776,13 @@ func (b *Brain) step(o *Obs, act *Action) {
 			t.Engage = t.Dist < b.P.EngageDist || now-t.HitMe < 4 || (aimed && t.Charging && t.Dist < 120) ||
 				(t.HP < 350 && t.Dist < 120) || o.Alive <= 2
 			off := math.Abs(angDiff(t.Aim[0], toMe))
+			// chargeengage: FFA-only. A visible laser charge aimed at us (0.15 rad) engages out to ChargeEngage m.
+			if b.P.ChargeEngage > 0 && ffaOn && !t.Engage && t.Charging && off < 0.15 && t.Dist < b.P.ChargeEngage {
+				t.Engage = true
+				if chargeFoe == nil || t.Dist < chargeFoe.Dist {
+					chargeFoe = t
+				}
+			}
 
 			if b.P.Vulture > 0 && ffaOn && hpFrac > 0.75 && t.HP < b.P.Vulture*t.MaxHP && off > 0.6 && t.Dist < 165 {
 				t.Engage = true
@@ -1010,6 +1024,11 @@ func (b *Brain) step(o *Obs, act *Action) {
 		b.coverMove(o, seen, &mx, &my):
 		boost = me.Energy > 30 && (mx != 0 || my != 0)
 		mode = "evade"
+	case chargeFoe != nil && !finishing && !(chargeFoe.LOS && laser != nil && laser.Charge >= laser.Stats.Charge-0.3 &&
+		chargeFoe.Dist <= laser.Stats.Range-5) && b.coverMove(o, seen, &mx, &my):
+		// chargeengage: no hot laser on the long-range charger, so break its line (coverMove) instead of fighting.
+		boost = me.Energy > 20 && (mx != 0 || my != 0)
+		mode = "chargecover"
 	case foe != nil:
 
 		ready := gun != nil && gun.Ammo > 0 && gun.Reload <= 0.25 && foe.Dist <= gun.Stats.Range-10
@@ -1378,6 +1397,13 @@ func (b *Brain) step(o *Obs, act *Action) {
 					continue // precharge: no charge for a foe that left LOS long ago or is far; a held one is let go
 				}
 				act.Fire[i] = true
+			}
+		}
+	}
+	if mode == "chargecover" {
+		for i, w := range me.Weapons {
+			if w != nil && i < 2 && w.Kind == "laser" && w.Charge <= 0 {
+				act.Fire[i] = false // chargeengage: no new charge (half speed) while breaking its line
 			}
 		}
 	}
@@ -2521,7 +2547,7 @@ func squadParams(p Params) Params {
 	// Keep practice exactly as giddy tuned it: our FFA changes stay off.
 	p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp = 0, 0, 0, false
 	p.TPJoin, p.BackOpen, p.PreCharge, p.PeekCD = 0, 0, 0, 0
-	p.RegenHide, p.WatchLast, p.HomeLOS = 0, 0, 0
+	p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2757,6 +2783,8 @@ func applyFlags(p *Params, spec string) {
 			p.WatchLast = f
 		case "homelos":
 			p.HomeLOS = f
+		case "chargeengage":
+			p.ChargeEngage = f
 		}
 	}
 }
@@ -2863,7 +2891,7 @@ func (b *Brain) safeFallback() {
 		p.CrowdR, p.HomeFrac, p.GunOnlyR, p.LateAlive = 0, 0, 0, 3
 		p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp, p.Vulture = 0, 0, 0, false, 0
 		p.LateR, p.HoldOut = 70, 0
-		p.RegenHide, p.WatchLast, p.HomeLOS = 0, 0, 0
+		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
 	}
 	off(&b.base)
 	b.regenOn = false

@@ -84,6 +84,37 @@ func TestHomeLOS(t *testing.T) {
 	}
 }
 
+// TestChargeEngage: a visible mech 150 m east charging its laser straight at us (block 10 m west of us).
+// Off: giddy ignores it (beyond 120 m). On with a cold laser: engaged, break LOS westward, no new laser charge.
+// On with a full laser aimed at it: fight (the laser case releases on target).
+func TestChargeEngage(t *testing.T) {
+	charger := MechSeen{ID: 6, Kind: "mech", Pos: Vec3{150, 0, 0}, Aim: [2]float64{math.Pi, 0}, HP: 1400, MaxHP: 1400,
+		Weapons: []string{"gun", "laser"}, Charging: true}
+
+	b := testBrain(-20, func(p *Params) {})
+	var act Action
+	b.step(testObs(1, 100, 1400, charger), &act)
+	if b.tracks[6].Engage || b.Mode == "fight" || b.Mode == "chargecover" {
+		t.Fatalf("chargeengage off: charger at 150 m engaged (mode %q)", b.Mode)
+	}
+
+	b = testBrain(-20, func(p *Params) { p.ChargeEngage = 200 })
+	act = Action{}
+	b.step(testObs(1, 100, 1400, charger), &act)
+	if !b.tracks[6].Engage || b.Mode != "chargecover" || act.Move[0] >= 0 || act.Fire[1] {
+		t.Fatalf("chargeengage cold: engage %v mode %q move %v fire %v", b.tracks[6].Engage, b.Mode, act.Move, act.Fire)
+	}
+
+	b = testBrain(-20, func(p *Params) { p.ChargeEngage = 200 })
+	o := testObs(1, 100, 1400, charger)
+	o.Self.Weapons[1].Charge = 0.75
+	act = Action{}
+	b.step(o, &act)
+	if b.Mode != "fight" || act.Fire[1] {
+		t.Fatalf("chargeengage hot: mode %q fire %v, want fight with the laser released", b.Mode, act.Fire)
+	}
+}
+
 // TestRegenHide: at 40% HP with nobody in view, regenhide hides from a mech last seen 10 s ago (west of us, the
 // block is east), keeps hiding while HP is below 90%, and lets go at 90%. With the flag off nothing changes.
 func TestRegenHide(t *testing.T) {
