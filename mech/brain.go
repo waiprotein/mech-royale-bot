@@ -99,6 +99,7 @@ type Brain struct {
 	otherDead          int
 	stickID            int
 	stickAt, loseAt    float64
+	myHitAt            map[int]float64
 }
 
 type Params struct {
@@ -168,6 +169,9 @@ type Params struct {
 	SqFinish     float64
 	// PracAt: match time after which, with no unexplained death yet, practice (squad) params switch on (giddy: 20).
 	PracAt float64
+	// BeamFFA: treat a laser/lightning shot from one mech landing on another mech (not us) that lost HP as proof
+	// of a free-for-all (the practice squad never fights itself), and leave practice mode at once.
+	BeamFFA bool
 }
 
 func DefaultParams() Params {
@@ -180,7 +184,8 @@ func DefaultParams() Params {
 	// Our FFA changes (local league, see the vault's experiment note): giddy's practice params switch on at
 	// 60 s instead of 20 s, retreat stays allowed until the next circle is <= 25 m, and the end-game pile-up
 	// at the final centre is skipped until the zone forces the bot in.
-	p.PracAt = 60
+	p.PracAt = 20
+	p.BeamFFA = true
 	p.LateR = 25
 	p.HoldOut = 368
 	p.HoldMin = 60
@@ -266,6 +271,7 @@ func (b *Brain) observe(o *Obs) {
 	}
 	eye := Vec3{me.Pos[0], me.Pos[1], me.Pos[2] + me.Stats.EyeHeight}
 	muzzle := Vec3{me.Pos[0], me.Pos[1], me.Pos[2] + me.Stats.MuzzleHeight}
+	b.beamCheck(o)
 	for i := range o.Mechs {
 		m := &o.Mechs[i]
 		tab := b.tracks
@@ -2155,6 +2161,8 @@ func applyFlags(p *Params, spec string) {
 			p.SqFinish = f
 		case "pracat":
 			p.PracAt = f
+		case "beamffa":
+			p.BeamFFA = on
 		case "lethalk":
 			p.LethalK = f
 		case "backstab":
@@ -2167,6 +2175,57 @@ func applyFlags(p *Params, spec string) {
 			p.DodgeBoost = f
 		case "threatboost":
 			p.ThreatBoost = f
+		}
+	}
+}
+
+// beamCheck latches notPractice when a beam from one mech lands on a different mech that is not us and that
+// lost HP since we last saw it (and not from our own hits). It runs before the tracks are updated, so a track
+// still holds the HP from our previous sighting.
+func (b *Brain) beamCheck(o *Obs) {
+	me := &o.Self
+	if b.myHitAt == nil {
+		b.myHitAt = map[int]float64{}
+	}
+	for _, e := range o.Events {
+		if e.Type == "hit" {
+			b.myHitAt[e.Target] = o.T
+		}
+	}
+	if !b.P.BeamFFA || b.notPractice || len(o.Beams) == 0 {
+		return
+	}
+	myR := b.Cfg.Mech.Radius*b.scaleOf(me.Cubes) + 2
+	for _, bm := range o.Beams {
+		if bm.By == me.ID || len(bm.Path) < 2 {
+			continue
+		}
+		end := bm.Path[1]
+		if bm.Kind == "laser" {
+			end = bm.Path[len(bm.Path)-1]
+		}
+		if hyp(end[0]-me.Pos[0], end[1]-me.Pos[1]) < myR {
+			continue // aimed at us
+		}
+		for i := range o.Mechs {
+			m := &o.Mechs[i]
+			if m.Kind != "mech" || m.ID == bm.By || m.ID == me.ID {
+				continue
+			}
+			sc := b.scaleOf(m.Cubes)
+			if hyp(end[0]-m.Pos[0], end[1]-m.Pos[1]) > b.Cfg.Mech.Radius*sc+1.5 ||
+				end[2] < m.Pos[2]-1.5 || end[2] > m.Pos[2]+b.Cfg.Mech.Height*sc+1.5 {
+				continue
+			}
+			t := b.tracks[m.ID]
+			if t == nil || o.T-t.Seen > 1.0 || m.HP >= t.HP-1 {
+				continue // must have lost HP since our last sighting
+			}
+			if at, ok := b.myHitAt[m.ID]; ok && o.T-at < 1.0 {
+				continue // we hit it ourselves
+			}
+			b.notPractice = true
+			return
 		}
 	}
 }

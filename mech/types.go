@@ -292,6 +292,15 @@ type Obs struct {
 	Drops       []Drop     `json:"drops"`
 	Zone        Zone       `json:"zone"`
 	Offer       *Offer     `json:"offer"`
+	Beams       []Beam     `json:"beams"`
+}
+
+// Beam is a laser beam or lightning arc fired by another mech that we could see (protocol §6).
+type Beam struct {
+	By   int     `json:"by"`
+	Kind string  `json:"kind"`
+	Path []Vec3  `json:"path"`
+	Age  float64 `json:"age"`
 }
 
 type Action struct {
