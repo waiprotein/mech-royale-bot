@@ -103,6 +103,7 @@ type Brain struct {
 	stickID            int
 	stickAt, loseAt    float64
 	myHitAt            map[int]float64
+	ffaNow             bool
 	// facesound: time (match s) and bearing of the newest unexplained weapon sound.
 	soundAt, soundBearing float64
 }
@@ -226,6 +227,10 @@ type Params struct {
 	// giddy's detector has proven a free-for-all (a death we did not cause). Practice play then stays identical to
 	// giddy e19e3c8 at salt 0 (6.19 on the board); other changes to practice play regress to ~5.5 (salt tests).
 	FFAStrict bool
+	// CrowdR [crowdr] / HomeFrac [homefrac]: FFA-only spacing. Crowd penalty radius in homeCost (giddy 80 m) and
+	// how far out of the next circle home spots are sampled (giddy 0.7 of its radius). 0 = giddy.
+	CrowdR   float64
+	HomeFrac float64
 }
 
 func DefaultParams() Params {
@@ -608,13 +613,14 @@ func (b *Brain) step(o *Obs, act *Action) {
 	now := o.T
 	b.observe(o)
 	ffaOn := !b.pracOn && (!b.P.FFAStrict || b.notPractice)
+	b.ffaNow = ffaOn
 	st := &me.Stats
 	x, y, zf := me.Pos[0], me.Pos[1], me.Pos[2]
 	z := &o.Zone
 	hpFrac := me.HP / math.Max(1, me.MaxHP)
 
 	if o.Offer != nil && len(o.Offer.Choices) > 0 {
-		p := pickUpgrade(o.Offer, b.P.LaserUp, b.P.NanoUp, b.P.SpeedUp)
+		p := pickUpgrade(o.Offer, b.P.LaserUp, b.P.NanoUp, b.P.SpeedUp && ffaOn)
 		act.Pick = &p
 	}
 
@@ -673,7 +679,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 				(t.HP < 350 && t.Dist < 120) || o.Alive <= 2
 			off := math.Abs(angDiff(t.Aim[0], toMe))
 
-			if b.P.Vulture > 0 && hpFrac > 0.75 && t.HP < b.P.Vulture*t.MaxHP && off > 0.6 && t.Dist < 165 {
+			if b.P.Vulture > 0 && ffaOn && hpFrac > 0.75 && t.HP < b.P.Vulture*t.MaxHP && off > 0.6 && t.Dist < 165 {
 				t.Engage = true
 			}
 			if b.P.Alert > 0 && t.LOS && t.Dist < b.P.Alert && (t.Closing > 3 || aimed) {
@@ -925,7 +931,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 			boost = true
 		}
 		mode = "fight"
-		if b.P.FightBoost > 0 && me.Energy > b.P.FightBoost && (laser == nil || laser.Charge <= 0) && (light == nil || me.Energy > 60) {
+		if b.P.FightBoost > 0 && ffaOn && me.Energy > b.P.FightBoost && (laser == nil || laser.Charge <= 0) && (light == nil || me.Energy > 60) {
 			boost = true
 		}
 		if b.P.FightLoot > 0 {
@@ -1010,12 +1016,12 @@ func (b *Brain) step(o *Obs, act *Action) {
 			if lz && me.Energy > 25 {
 				boost = true
 			}
-			if b.P.DodgeBoost > 0 && me.Energy > b.P.DodgeBoost {
+			if b.P.DodgeBoost > 0 && ffaOn && me.Energy > b.P.DodgeBoost {
 				boost = true
 			}
 		}
 	}
-	if b.P.ThreatBoost > 0 && me.Energy > b.P.ThreatBoost && (foe != nil || now-b.lastHurt < 2.5) && (light == nil || me.Energy > 60) {
+	if b.P.ThreatBoost > 0 && ffaOn && me.Energy > b.P.ThreatBoost && (foe != nil || now-b.lastHurt < 2.5) && (light == nil || me.Energy > 60) {
 		boost = true
 	}
 
@@ -1967,9 +1973,13 @@ func (b *Brain) exploreMove(o *Obs) (float64, float64) {
 func (b *Brain) homeCost(o *Obs, px, py float64) float64 {
 	z := &o.Zone
 	crowd := 0.0
+	crowdR := 80.0
+	if b.ffaNow && b.P.CrowdR > 0 {
+		crowdR = b.P.CrowdR
+	}
 	for _, t := range b.tracks {
 		if b.now-t.Seen < 20 {
-			crowd += math.Max(0, 80-hyp(t.Pos[0]-px, t.Pos[1]-py)) / 80
+			crowd += math.Max(0, crowdR-hyp(t.Pos[0]-px, t.Pos[1]-py)) / crowdR
 		}
 	}
 	for i := range o.Drops {
@@ -1990,7 +2000,11 @@ func (b *Brain) home(o *Obs) (float64, float64, bool) {
 		best, bestC := [2]float64{}, math.Inf(1)
 		for k := 0; k < 40; k++ {
 			a := b.rng.Float64() * 2 * math.Pi
-			r := math.Sqrt(b.rng.Float64()) * z.NextRadius * 0.7
+			frac := 0.7
+			if b.ffaNow && b.P.HomeFrac > 0 {
+				frac = b.P.HomeFrac
+			}
+			r := math.Sqrt(b.rng.Float64()) * z.NextRadius * frac
 			px, py := z.NextCenter[0]+math.Cos(a)*r, z.NextCenter[1]+math.Sin(a)*r
 			if !b.W.InBounds(px, py) || !b.W.Reachable(px, py) {
 				continue
@@ -2208,7 +2222,8 @@ func squadParams(p Params) Params {
 	if p.SqFinish > 0 {
 		p.Finish = p.SqFinish
 	}
-	// Keep practice exactly as giddy tuned it: our FFA end-game changes stay off.
+	// Keep practice exactly as giddy tuned it: our FFA changes stay off.
+	p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp = 0, 0, 0, false
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2372,6 +2387,10 @@ func applyFlags(p *Params, spec string) {
 			p.FaceSound = on
 		case "hunthide":
 			p.HuntHide = on
+		case "crowdr":
+			p.CrowdR = f
+		case "homefrac":
+			p.HomeFrac = f
 		case "ffastrict":
 			p.FFAStrict = on
 		case "keeplaser":
