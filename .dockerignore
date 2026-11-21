@@ -1,19 +1,13 @@
-# Keep the image context to what the bot needs at runtime.
+# Keep the image context to what the build needs.
 .git
 .gitignore
 .gitattributes
 .dockerignore
+README.md
 tools/
 logs/
-replays/
 tmp/
+*.exe
 *.log
 *.jsonl
 *.jsonl.gz
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-.vscode/
-.idea/
-README.md
