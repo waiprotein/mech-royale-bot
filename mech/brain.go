@@ -123,6 +123,14 @@ type Brain struct {
 	// peekcd (bit 2): id of the hidden foe whose laser we heard fire, and when its cooldown ends.
 	cdID    int
 	cdUntil float64
+	// regenhide: latched while regenerating in cover, and when the latch started.
+	regenOn bool
+	regenAt float64
+	// homelos: eyes of the recently seen mechs for this tick's home costs (valid while losTick == tick+1), and
+	// whether a fresh mech saw our home at the previous check.
+	losEyes []Vec3
+	losTick int
+	homeVis bool
 }
 
 type Params struct {
@@ -296,6 +304,30 @@ type Params struct {
 	LRLaser float64
 	LRHP    float64
 	LRKeep  float64
+	// RegenHide [regenhide]: FFA-only (ffaOn). Below this HP share with no target or foe (and not late), latch
+	// regen-hide: coverMove from every mech seen in the last 20 s (giddy's cover uses only the last 2.5 s), stand
+	// still once hidden, and skip crate farming and the loot choice (dealing damage restarts the 5 s regen
+	// delay). Released at 90% HP, after 30 s, when late or when ffaOn drops; a foe or a zoneShould move takes
+	// precedence while it holds. 0 = off.
+	RegenHide float64
+	// WatchLast [watchlast]: FFA-only (ffaOn). Idle aim (no target, nothing farmed, no engaged/hit-us mech to
+	// watch, no recent damage or facesound bearing): face the nearest mech seen in the last WatchLast s within
+	// 200 m with a ±0.9 rad (±52°) sweep, so it stays inside the 120° view wedge, instead of the walking sweep
+	// around the heading or the 3.5 rad/s standing spin. 0 = off.
+	WatchLast float64
+	// HomeLOS [homelos]: FFA-only (ffaOn). homeCost adds, for each of the (up to 4, nearest us) mechs seen in the
+	// last 20 s whose eye has line of sight (W.Clear) to our eye height at the candidate spot, HomeLOS if it is
+	// 85-200 m from the spot and 5 x HomeLOS within 85 m (exchange rate from the calm-mech snapshots), capped at
+	// 15 x HomeLOS per spot; giddy's static exposure term is unchanged. home/holdHome re-choose at once (not on the
+	// 12 s timer) when a mech seen this tick gains sight of the current home. Home-spot selection only: loot, cube
+	// and zone moves run before home in step and are untouched. At most 4 LOS checks per candidate. 0 = off.
+	HomeLOS float64
+	// ChargeEngage [chargeengage]: FFA-only (ffaOn). A visible mech charging a laser with its aim within 0.15 rad of
+	// us is engaged out to this range (giddy: within 0.22 rad, to 120 m; only mechs giddy's rule leaves out are
+	// added). If our laser is hot (within 0.3 s of full, in range) and it is in line of sight, the fight branch
+	// fires when on target; otherwise we break its line with coverMove (boost, no new laser charge so we keep
+	// full speed), unless we are finishing a target. 0 = off.
+	ChargeEngage float64
 }
 
 func DefaultParams() Params {
@@ -721,6 +753,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 
 	var seen []*Track
 	var target, hidden, shy *Track
+	var chargeFoe *Track // chargeengage: nearest long-range charger engaged only by that flag
 	bestScore := math.Inf(1)
 	maxT, hpw := 215.0, 60.0/1400
 	if b.P.MaxTarget > 0 {
@@ -760,6 +793,13 @@ func (b *Brain) step(o *Obs, act *Action) {
 			t.Engage = t.Dist < b.P.EngageDist || now-t.HitMe < 4 || (aimed && t.Charging && t.Dist < 120) ||
 				(t.HP < 350 && t.Dist < 120) || o.Alive <= 2
 			off := math.Abs(angDiff(t.Aim[0], toMe))
+			// chargeengage: FFA-only. A visible laser charge aimed at us (0.15 rad) engages out to ChargeEngage m.
+			if b.P.ChargeEngage > 0 && ffaOn && !t.Engage && t.Charging && off < 0.15 && t.Dist < b.P.ChargeEngage {
+				t.Engage = true
+				if chargeFoe == nil || t.Dist < chargeFoe.Dist {
+					chargeFoe = t
+				}
+			}
 
 			if b.P.Vulture > 0 && ffaOn && hpFrac > 0.75 && t.HP < b.P.Vulture*t.MaxHP && off > 0.6 && t.Dist < 165 {
 				t.Engage = true
@@ -929,6 +969,14 @@ func (b *Brain) step(o *Obs, act *Action) {
 		}
 		b.retreat = now-b.loseAt < 1.5 && b.loseAt > 0
 	}
+	// regenhide: FFA-only. Latch below RegenHide with no target/foe; release at 90% HP, after 30 s, when late or
+	// when FFA play stops (see RegenHide).
+	if b.P.RegenHide > 0 && ffaOn && !late && !b.regenOn && hpFrac < b.P.RegenHide && foe == nil {
+		b.regenOn, b.regenAt = true, now
+	}
+	if b.regenOn && (b.P.RegenHide <= 0 || !ffaOn || late || hpFrac >= 0.9 || now-b.regenAt > 30) {
+		b.regenOn = false
+	}
 
 	exposed := false
 	for _, t := range seen {
@@ -991,6 +1039,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 	case target == nil && now-b.lastHurt < 2.5 && !late && b.P.Ghost && b.hideFromBearing(o, seen, &mx, &my):
 		boost = me.Energy > 30 && (mx != 0 || my != 0)
 		mode = "cover"
+	case b.regenOn && foe == nil && !(zoneShould && zdist > 2) && b.coverMove(o, b.recentMechs(x, y, 20), &mx, &my):
+		// regenhide: walk (no boost) into cover from every mech seen in the last 20 s; coverMove stands still
+		// once hidden. With no such mech within 230 m (or no cover) we fall through to home, without loot.
+		mode = "regen"
 	case now < b.P.EarlyHide && exposed && !finishing && b.coverMove(o, seen, &mx, &my):
 		boost = me.Energy > 20 && (mx != 0 || my != 0)
 		mode = "earlyhide"
@@ -1001,6 +1053,11 @@ func (b *Brain) step(o *Obs, act *Action) {
 		b.coverMove(o, seen, &mx, &my):
 		boost = me.Energy > 30 && (mx != 0 || my != 0)
 		mode = "evade"
+	case chargeFoe != nil && !finishing && !(chargeFoe.LOS && laser != nil && laser.Charge >= laser.Stats.Charge-0.3 &&
+		chargeFoe.Dist <= laser.Stats.Range-5) && b.coverMove(o, seen, &mx, &my):
+		// chargeengage: no hot laser on the long-range charger, so break its line (coverMove) instead of fighting.
+		boost = me.Energy > 20 && (mx != 0 || my != 0)
+		mode = "chargecover"
 	case foe != nil:
 
 		ready := gun != nil && gun.Ammo > 0 && gun.Reload <= 0.25 && foe.Dist <= gun.Stats.Range-10
@@ -1086,7 +1143,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 		mx, my = b.travel(me, zgx, zgy)
 		mode = "zone"
 	default:
-		lc := b.chooseLoot(o, hpFrac, danger)
+		var lc *lootChoice
+		if !b.regenOn { // regenhide: no loot run (crate/NPC hits restart the regen delay) while regenerating
+			lc = b.chooseLoot(o, hpFrac, danger)
+		}
 		if lc != nil {
 			mode = "loot:" + lc.kind
 			switch lc.kind {
@@ -1200,7 +1260,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 			farm, farmPos, defend = worst, nil, true
 		}
 	}
-	if b.P.Econ && target == nil && farm == nil && farmPos == nil && gun != nil && !b.retreat {
+	if b.P.Econ && target == nil && farm == nil && farmPos == nil && gun != nil && !b.retreat && !b.regenOn { // regenhide: no crates
 
 		reach := 110.0
 		for _, t := range b.tracks {
@@ -1373,6 +1433,13 @@ func (b *Brain) step(o *Obs, act *Action) {
 			}
 		}
 	}
+	if mode == "chargecover" {
+		for i, w := range me.Weapons {
+			if w != nil && i < 2 && w.Kind == "laser" && w.Charge <= 0 {
+				act.Fire[i] = false // chargeengage: no new charge (half speed) while breaking its line
+			}
+		}
+	}
 
 	if b.P.FaceSound {
 		b.hearShots(o)
@@ -1387,6 +1454,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 				}
 			}
 		}
+		var last *Track
+		if b.P.WatchLast > 0 && ffaOn && target == nil && farm == nil && farmPos == nil {
+			last = b.lastSeen(x, y) // watchlast
+		}
 		switch {
 		case watch != nil:
 			aim[0] = math.Atan2(watch.Pos[1]-y, watch.Pos[0]-x)
@@ -1397,6 +1468,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		case b.P.FaceSound && ffaOn && target == nil && farm == nil && farmPos == nil && now-b.soundAt < 1.5:
 			// facesound: FFA-only (!pracOn); below watch/npc/hurt bearings, above the walking scan.
 			aim[0] = b.soundBearing
+		case last != nil:
+			// watchlast: FFA-only; keep the last-seen mech in the 120° wedge with a ±52° sweep (above the scans).
+			aim[0] = math.Atan2(last.Pos[1]-y, last.Pos[0]-x) + 0.9*math.Sin(now*1.3)
 		case mx != 0 || my != 0:
 			aim[0] = math.Atan2(my, mx) + 1.15*math.Sin(now*1.3)
 		default:
@@ -2138,16 +2212,86 @@ func (b *Brain) homeCost(o *Obs, px, py float64) float64 {
 		crowd += math.Max(0, 60-hyp(o.Drops[i].Pos[0]-px, o.Drops[i].Pos[1]-py)) / 60
 	}
 	edge := hyp(px-z.NextCenter[0], py-z.NextCenter[1]) / math.Max(30, z.NextRadius)
-	return b.P.HomeExpo*b.W.Exposure(px, py) + 0.25*hyp(px-o.Self.Pos[0], py-o.Self.Pos[1]) + 40*crowd + 10*edge
+	c := b.P.HomeExpo*b.W.Exposure(px, py) + 0.25*hyp(px-o.Self.Pos[0], py-o.Self.Pos[1]) + 40*crowd + 10*edge
+	if b.ffaNow && b.P.HomeLOS > 0 {
+		c += b.homeLOSCost(o, px, py) // homelos
+	}
+	return c
+}
+
+// homeLOSCost (homelos) is the sightline penalty for standing at (px, py): for each of up to 4 recently seen
+// mechs whose eye sees our eye height there, HomeLOS at 85-200 m and 5 x HomeLOS within 85 m, capped at 3 near
+// mechs' worth (15 x HomeLOS) so it biases the home choice rather than dominating it.
+func (b *Brain) homeLOSCost(o *Obs, px, py float64) float64 {
+	spot := Vec3{px, py, b.W.WalkAt(px, py) + o.Self.Stats.EyeHeight}
+	c := 0.0
+	for _, e := range b.homeEyes(o) {
+		d := hyp(e[0]-px, e[1]-py)
+		if d > 200 || !b.W.Clear(e, spot) {
+			continue
+		}
+		if d < 85 {
+			c += 5 * b.P.HomeLOS
+		} else {
+			c += b.P.HomeLOS
+		}
+	}
+	return math.Min(c, 15*b.P.HomeLOS)
+}
+
+// homeEyes (homelos) returns the eyes of the 4 mechs seen in the last 20 s nearest us, cached per tick, which
+// caps a home re-choice at 4 LOS checks per candidate (40 + 1 candidates, 48 + 1 in holdHome).
+func (b *Brain) homeEyes(o *Obs) []Vec3 {
+	if b.losTick != o.Tick+1 {
+		b.losTick = o.Tick + 1
+		b.losEyes = b.losEyes[:0]
+		for _, t := range b.recentMechs(o.Self.Pos[0], o.Self.Pos[1], 20) {
+			if len(b.losEyes) == 4 {
+				break
+			}
+			b.losEyes = append(b.losEyes, b.eye(t))
+		}
+	}
+	return b.losEyes
+}
+
+// homeSeen (homelos) reports that a mech seen this tick (one of the 4 nearest the home spot, within 200 m) has
+// gained line of sight to our eye height at the current home, so home/holdHome re-choose at once. A gain right
+// after a re-choice (within 1 s) waits a tick, so a home that every spot's sightline covers is not re-chosen
+// every tick.
+func (b *Brain) homeSeen(o *Obs) bool {
+	if !b.ffaNow || b.P.HomeLOS <= 0 || !b.homeSet {
+		b.homeVis = false
+		return false
+	}
+	hx, hy := b.homeXY[0], b.homeXY[1]
+	spot := Vec3{hx, hy, b.W.WalkAt(hx, hy) + o.Self.Stats.EyeHeight}
+	vis := false
+	for i, t := range b.recentMechs(hx, hy, 0) {
+		if i == 4 || hyp(t.Pos[0]-hx, t.Pos[1]-hy) > 200 {
+			break
+		}
+		if b.W.Clear(b.eye(t), spot) {
+			vis = true
+			break
+		}
+	}
+	if vis && !b.homeVis && b.now-b.homeAt <= 1 {
+		return false
+	}
+	gained := vis && !b.homeVis
+	b.homeVis = vis
+	return gained
 }
 
 func (b *Brain) home(o *Obs) (float64, float64, bool) {
 	z := &o.Zone
+	force := b.homeSeen(o) // homelos: a fresh sightline onto home re-chooses at once (false when off)
 	if b.holdingOut(z, o.Alive) {
-		return b.holdHome(o)
+		return b.holdHome(o, force)
 	}
 	out := !b.homeSet || hyp(b.homeXY[0]-z.NextCenter[0], b.homeXY[1]-z.NextCenter[1]) > z.NextRadius*0.8
-	if out || b.now-b.homeAt > 12 {
+	if out || b.now-b.homeAt > 12 || force {
 		b.homeAt = b.now
 		best, bestC := [2]float64{}, math.Inf(1)
 		for k := 0; k < 40; k++ {
@@ -2177,6 +2321,34 @@ func (b *Brain) hideFromBearing(o *Obs, seen []*Track, mx, my *float64) bool {
 	ghost := &Track{}
 	ghost.Pos = Vec3{me.Pos[0] + math.Cos(b.hurtBearing)*80, me.Pos[1] + math.Sin(b.hurtBearing)*80, me.Pos[2]}
 	return b.coverMove(o, append([]*Track{ghost}, seen...), mx, my)
+}
+
+// recentMechs returns the mech tracks seen within the last s seconds (at their current or last known
+// position), nearest to (x, y) first, ties by id so the order never depends on map iteration (regenhide).
+func (b *Brain) recentMechs(x, y, s float64) []*Track {
+	var out []*Track
+	for _, t := range b.tracks {
+		if b.now-t.Seen <= s {
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		di, dj := hyp(out[i].Pos[0]-x, out[i].Pos[1]-y), hyp(out[j].Pos[0]-x, out[j].Pos[1]-y)
+		if di != dj {
+			return di < dj
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+// lastSeen (watchlast) returns the nearest mech seen within the last WatchLast s whose current or last known
+// position is within 200 m of (x, y), or nil.
+func (b *Brain) lastSeen(x, y float64) *Track {
+	if r := b.recentMechs(x, y, b.P.WatchLast); len(r) > 0 && hyp(r[0].Pos[0]-x, r[0].Pos[1]-y) <= 200 {
+		return r[0]
+	}
+	return nil
 }
 
 func (b *Brain) dodge(o *Obs) (dx, dy float64, laser bool) {
@@ -2448,6 +2620,7 @@ func squadParams(p Params) Params {
 	p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp = 0, 0, 0, false
 	p.TPJoin, p.BackOpen, p.PreCharge, p.PeekCD = 0, 0, 0, 0
 	p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
+	p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2524,7 +2697,8 @@ func (b *Brain) holdingOut(z *Zone, alive int) bool {
 
 // holdHome picks a hidden spot inside the current circle, between HoldMin and HoldMin+25 m from the final
 // centre. The normal zone deadline logic (zoneMust) still pulls the bot in before the circle reaches it.
-func (b *Brain) holdHome(o *Obs) (float64, float64, bool) {
+// force (homelos) re-chooses at once.
+func (b *Brain) holdHome(o *Obs, force bool) (float64, float64, bool) {
 	z := &o.Zone
 	c := b.curZone(z)
 	minD := b.P.HoldMin
@@ -2535,7 +2709,7 @@ func (b *Brain) holdHome(o *Obs) (float64, float64, bool) {
 		d := hyp(px-z.NextCenter[0], py-z.NextCenter[1])
 		return d >= minD*0.8 && hyp(px-c.X, py-c.Y) <= c.R-12
 	}
-	if !b.homeSet || !valid(b.homeXY[0], b.homeXY[1]) || b.now-b.homeAt > 12 {
+	if !b.homeSet || !valid(b.homeXY[0], b.homeXY[1]) || b.now-b.homeAt > 12 || force {
 		b.homeAt = b.now
 		best, bestC := [2]float64{}, math.Inf(1)
 		for k := 0; k < 48; k++ {
@@ -2682,6 +2856,14 @@ func applyFlags(p *Params, spec string) {
 			p.LRHP = f
 		case "lrkeep":
 			p.LRKeep = f
+		case "regenhide":
+			p.RegenHide = f
+		case "watchlast":
+			p.WatchLast = f
+		case "homelos":
+			p.HomeLOS = f
+		case "chargeengage":
+			p.ChargeEngage = f
 		}
 	}
 }
@@ -2789,8 +2971,10 @@ func (b *Brain) safeFallback() {
 		p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp, p.Vulture = 0, 0, 0, false, 0
 		p.LateR, p.HoldOut = 70, 0
 		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
+		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
 	}
 	off(&b.base)
+	b.regenOn = false
 	if b.pracOn {
 		b.P = squadParams(b.base)
 	} else {
