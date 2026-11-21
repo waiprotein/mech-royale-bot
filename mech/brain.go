@@ -215,6 +215,13 @@ type Params struct {
 	// us (Track.CalmAt). Heuristic: the practice house squad hunts us, FFA copies hunt each other.
 	// Risk: idle house-squad members that do not aim at us would also trigger it and change practice play.
 	HuntHide bool
+	// KeepLaser [keeplaser]: not mode-gated. giddy's LaserFirst (on in both modes) already ranks laser over
+	// lightning in wantPickup, so a held laser is never swapped for lightning and a laser is wanted over held
+	// lightning. KeepLaser adds what is missing: that ranking even with LaserFirst off, and, while we hold
+	// lightning, a laser pickup within loot reach (LootRadius, or LaserSeek if larger) is valued 150 (giddy:
+	// 60, below a cube's 75) in chooseLoot, so we go and swap it in. No effect under squad params (LaserSeek
+	// 240 already values it 150).
+	KeepLaser bool
 }
 
 func DefaultParams() Params {
@@ -1329,7 +1336,7 @@ func (b *Brain) wantPickup(me *Self, kind string) bool {
 		return false
 	}
 	rank := func(k string) int {
-		if b.P.LaserFirst && k == "laser" {
+		if (b.P.LaserFirst || b.P.KeepLaser) && k == "laser" {
 			return 4
 		}
 		return weaponRank[k]
@@ -1864,6 +1871,11 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 			if seek {
 				v = math.Max(v, 150)
 			}
+			if b.P.KeepLaser && p.Kind == "laser" {
+				if _, l := hasWeapon(me.Weapons, "lightning"); l != nil {
+					v = math.Max(v, 150) // keeplaser: swap held lightning for a laser in reach
+				}
+			}
 			consider("pickup", p.ID, p.Pos, v)
 		}
 	}
@@ -2127,19 +2139,19 @@ func (b *Brain) hearShots(o *Obs) {
 	}
 }
 
-// duelOdds is the chance that we win a duel against t, from the logistic fit on recorded top-16 showdowns
-// (vault: Data/Showdown analysis.md): +3.3 per unit of ln(HP ratio), +0.9 per 10 cubes (each side capped
-// at 10), -1.8 when t holds a laser and we do not, +1.8 the other way round. There is no intercept, so
-// equal HP and kit gives 0.5. Used only by DuelFlee.
+// duelOdds is the chance that we win a duel against t, from the logistic refit on 129 decisive engagements
+// in recorded top-16 showdowns (vault: Data/Showdown analysis.md, Sat 21:40 GMT): +2.3 per unit of ln(HP
+// ratio), +0.8 per 10 cubes (each side capped at 10), -0.8 when t holds a laser, +0.5 when t's back is
+// turned to us. There is no intercept, so equal HP and kit gives 0.5. Used only by DuelFlee.
 func (b *Brain) duelOdds(me *Self, t *Track) float64 {
 	capc := func(c int) float64 { return math.Min(float64(c), 10) }
-	_, myLaser := hasWeapon(me.Weapons, "laser")
-	theirLaser := holds(t.Weapons, "laser")
-	z := 3.3*math.Log(math.Max(me.HP, 1)/math.Max(t.HP, 1)) + 0.09*(capc(me.Cubes)-capc(t.Cubes))
-	if theirLaser && myLaser == nil {
-		z -= 1.8
-	} else if myLaser != nil && !theirLaser {
-		z += 1.8
+	z := 2.3*math.Log(math.Max(me.HP, 1)/math.Max(t.HP, 1)) + 0.08*(capc(me.Cubes)-capc(t.Cubes))
+	if holds(t.Weapons, "laser") {
+		z -= 0.8
+	}
+	toMe := math.Atan2(me.Pos[1]-t.Pos[1], me.Pos[0]-t.Pos[0])
+	if math.Abs(angDiff(t.Aim[0], toMe)) > math.Pi/2 {
+		z += 0.5
 	}
 	return 1 / (1 + math.Exp(-z))
 }
@@ -2339,6 +2351,8 @@ func applyFlags(p *Params, spec string) {
 			p.FaceSound = on
 		case "hunthide":
 			p.HuntHide = on
+		case "keeplaser":
+			p.KeepLaser = on
 		}
 	}
 }
