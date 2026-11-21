@@ -301,9 +301,10 @@ type Params struct {
 	WatchLast float64
 	// HomeLOS [homelos]: FFA-only (ffaOn). homeCost adds, for each of the (up to 4, nearest us) mechs seen in the
 	// last 20 s whose eye has line of sight (W.Clear) to our eye height at the candidate spot, HomeLOS if it is
-	// 85-200 m from the spot and 5 x HomeLOS within 85 m (exchange rate from the calm-mech snapshots); giddy's
-	// static exposure term is unchanged. home/holdHome re-choose at once (not on the 12 s timer) when a mech seen
-	// this tick gains sight of the current home. At most 4 LOS checks per candidate. 0 = off.
+	// 85-200 m from the spot and 5 x HomeLOS within 85 m (exchange rate from the calm-mech snapshots), capped at
+	// 15 x HomeLOS per spot; giddy's static exposure term is unchanged. home/holdHome re-choose at once (not on the
+	// 12 s timer) when a mech seen this tick gains sight of the current home. Home-spot selection only: loot, cube
+	// and zone moves run before home in step and are untouched. At most 4 LOS checks per candidate. 0 = off.
 	HomeLOS float64
 	// ChargeEngage [chargeengage]: FFA-only (ffaOn). A visible mech charging a laser with its aim within 0.15 rad of
 	// us is engaged out to this range (giddy: within 0.22 rad, to 120 m; only mechs giddy's rule leaves out are
@@ -2187,7 +2188,8 @@ func (b *Brain) homeCost(o *Obs, px, py float64) float64 {
 }
 
 // homeLOSCost (homelos) is the sightline penalty for standing at (px, py): for each of up to 4 recently seen
-// mechs whose eye sees our eye height there, HomeLOS at 85-200 m and 5 x HomeLOS within 85 m.
+// mechs whose eye sees our eye height there, HomeLOS at 85-200 m and 5 x HomeLOS within 85 m, capped at 3 near
+// mechs' worth (15 x HomeLOS) so it biases the home choice rather than dominating it.
 func (b *Brain) homeLOSCost(o *Obs, px, py float64) float64 {
 	spot := Vec3{px, py, b.W.WalkAt(px, py) + o.Self.Stats.EyeHeight}
 	c := 0.0
@@ -2202,7 +2204,7 @@ func (b *Brain) homeLOSCost(o *Obs, px, py float64) float64 {
 			c += b.P.HomeLOS
 		}
 	}
-	return c
+	return math.Min(c, 15*b.P.HomeLOS)
 }
 
 // homeEyes (homelos) returns the eyes of the 4 mechs seen in the last 20 s nearest us, cached per tick, which

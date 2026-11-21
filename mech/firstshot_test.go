@@ -58,7 +58,7 @@ func TestWatchLast(t *testing.T) {
 }
 
 // TestHomeLOS: the sightline penalty is 5 x homelos within 85 m of a recently seen mech, homelos at 85-200 m,
-// and nothing behind the block, beyond 200 m, or with the flag off.
+// and nothing behind the block, beyond 200 m, or with the flag off; the total is capped at 15 x homelos.
 func TestHomeLOS(t *testing.T) {
 	west := MechSeen{ID: 5, Kind: "mech", Pos: Vec3{-50, 0, 0}, Aim: [2]float64{math.Pi / 2, 0}, HP: 1400, MaxHP: 1400, Weapons: []string{"gun"}}
 	for _, w := range []float64{0, 60} {
@@ -81,6 +81,20 @@ func TestHomeLOS(t *testing.T) {
 				t.Fatalf("homelos=%v at (%v,%v): cost %v, want %v", w, c.x, c.y, got, c.want)
 			}
 		}
+	}
+	// Four near mechs in sight (4 x 300) are capped at 3 near mechs' worth (900).
+	b := testBrain(10, func(p *Params) { p.HomeLOS = 60 })
+	var four []MechSeen
+	for k, y := range []float64{-6, -2, 2, 6} {
+		m := west
+		m.ID, m.Pos = 5+k, Vec3{-50, y, 0}
+		four = append(four, m)
+	}
+	o := testObs(1, 100, 1400, four...)
+	var act Action
+	b.step(o, &act)
+	if got := b.homeLOSCost(o, 0, 0); got != 900 {
+		t.Fatalf("homelos cap: cost %v, want 900", got)
 	}
 }
 
