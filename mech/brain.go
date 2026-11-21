@@ -2149,21 +2149,32 @@ func (b *Brain) hearShots(o *Obs) {
 	}
 }
 
-// duelOdds is the chance that we win a duel against t, from the logistic refit on 129 decisive engagements
-// in recorded top-16 showdowns (vault: Data/Showdown analysis.md, Sat 21:40 GMT): +2.3 per unit of ln(HP
-// ratio), +0.8 per 10 cubes (each side capped at 10), -0.8 when t holds a laser, +0.5 when t's back is
-// turned to us. There is no intercept, so equal HP and kit gives 0.5. Used only by DuelFlee.
+// duelOdds is the chance that we win a duel against t, from the logistic fit on 187 decisive engagements in
+// recorded top-16 showdowns (vault: Data/Showdown analysis.md, Sat 22:10 GMT). For the side that shot first:
+// z = 0.94 + 4.0·ln(HP_shooter/HP_target) + 0.74·[shooter holds laser] − 1.19·[target holds laser]
+// + 0.68·[target's back turned]. If t has been hitting us (shot first), our chance is 1 − P(t wins as shooter).
+// Used only by DuelFlee.
 func (b *Brain) duelOdds(me *Self, t *Track) float64 {
-	capc := func(c int) float64 { return math.Min(float64(c), 10) }
-	z := 2.3*math.Log(math.Max(me.HP, 1)/math.Max(t.HP, 1)) + 0.08*(capc(me.Cubes)-capc(t.Cubes))
-	if holds(t.Weapons, "laser") {
-		z -= 0.8
+	sig := func(z float64) float64 { return 1 / (1 + math.Exp(-z)) }
+	_, ml := hasWeapon(me.Weapons, "laser")
+	meLaser, themLaser := ml != nil, holds(t.Weapons, "laser")
+	ind := func(v bool) float64 {
+		if v {
+			return 1
+		}
+		return 0
+	}
+	hpMe, hpThem := math.Max(me.HP, 1), math.Max(t.HP, 1)
+	if b.now-t.HitMe < 4 {
+		// t shot first: its back-turned term refers to us (our aim away from t).
+		toT := math.Atan2(t.Pos[1]-me.Pos[1], t.Pos[0]-me.Pos[0])
+		meBack := math.Abs(angDiff(me.Aim[0], toT)) > math.Pi/2
+		z := 0.94 + 4.0*math.Log(hpThem/hpMe) + 0.74*ind(themLaser) - 1.19*ind(meLaser) + 0.68*ind(meBack)
+		return 1 - sig(z)
 	}
 	toMe := math.Atan2(me.Pos[1]-t.Pos[1], me.Pos[0]-t.Pos[0])
-	if math.Abs(angDiff(t.Aim[0], toMe)) > math.Pi/2 {
-		z += 0.5
-	}
-	return 1 / (1 + math.Exp(-z))
+	themBack := math.Abs(angDiff(t.Aim[0], toMe)) > math.Pi/2
+	return sig(0.94 + 4.0*math.Log(hpMe/hpThem) + 0.74*ind(meLaser) - 1.19*ind(themLaser) + 0.68*ind(themBack))
 }
 
 func squadParams(p Params) Params {
