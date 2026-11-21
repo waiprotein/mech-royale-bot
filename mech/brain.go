@@ -193,6 +193,10 @@ type Params struct {
 	// holds a laser beyond lightning range + 5 m, take the swamped -> retreat -> cover path (break LOS)
 	// instead of trading gun fire, unless we are finishing it.
 	LightLOS bool
+	// DuelFlee [duelflee]: FFA-only (!pracOn). If duelOdds (the duel model refitted on recorded top-16
+	// showdowns) for the current target is below this, flee for 5 s through OddsFlee's plumbing
+	// (oddsFleeUntil -> swamped -> retreat -> cover), unless we are finishing it. 0 = off.
+	DuelFlee float64
 }
 
 func DefaultParams() Params {
@@ -709,6 +713,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 	}
 	swamped := b.P.CrowdHide && (crowd >= 3 || (crowd == 2 && hpFrac < 0.65) || outgunned)
 	if b.P.OddsFlee > 0 && target != nil && !finishing && b.odds(me, target, now, false) < b.P.OddsFlee {
+		b.oddsFleeUntil = now + 5
+	}
+	// duelflee: FFA-only (!pracOn); same flee latch as OddsFlee.
+	if b.P.DuelFlee > 0 && !b.pracOn && target != nil && !finishing && b.duelOdds(me, target) < b.P.DuelFlee {
 		b.oddsFleeUntil = now + 5
 	}
 	if now < b.oddsFleeUntil && !finishing {
@@ -2041,6 +2049,23 @@ func (b *Brain) odds(me *Self, t *Track, now float64, opening bool) float64 {
 	return 1 / (1 + math.Exp(-z))
 }
 
+// duelOdds is the chance that we win a duel against t, from the logistic fit on recorded top-16 showdowns
+// (vault: Data/Showdown analysis.md): +3.3 per unit of ln(HP ratio), +0.9 per 10 cubes (each side capped
+// at 10), -1.8 when t holds a laser and we do not, +1.8 the other way round. There is no intercept, so
+// equal HP and kit gives 0.5. Used only by DuelFlee.
+func (b *Brain) duelOdds(me *Self, t *Track) float64 {
+	capc := func(c int) float64 { return math.Min(float64(c), 10) }
+	_, myLaser := hasWeapon(me.Weapons, "laser")
+	theirLaser := holds(t.Weapons, "laser")
+	z := 3.3*math.Log(math.Max(me.HP, 1)/math.Max(t.HP, 1)) + 0.09*(capc(me.Cubes)-capc(t.Cubes))
+	if theirLaser && myLaser == nil {
+		z -= 1.8
+	} else if myLaser != nil && !theirLaser {
+		z += 1.8
+	}
+	return 1 / (1 + math.Exp(-z))
+}
+
 func squadParams(p Params) Params {
 	p.Ghost = false
 	p.Peek = false
@@ -2230,6 +2255,8 @@ func applyFlags(p *Params, spec string) {
 			p.LateAlive = int(f)
 		case "lightlos":
 			p.LightLOS = on
+		case "duelflee":
+			p.DuelFlee = f
 		}
 	}
 }
