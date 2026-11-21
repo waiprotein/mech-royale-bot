@@ -187,6 +187,9 @@ func NewBrain(h *Hello, w *World) *Brain {
 	if seed == 0 {
 		seed = int64(h.Slot) + 1
 	}
+	if Salt != 0 {
+		seed ^= int64(uint64(Salt) * 0x5851F42D4C957F2D)
+	}
 	p := DefaultParams()
 	applyFlags(&p, os.Getenv("MECH_FLAGS"))
 	return &Brain{
