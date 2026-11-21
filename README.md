@@ -6,7 +6,7 @@ Our entry for **Builders – Mech Royale** (joinbuilders.org buildathon): a bot 
 
 This bot is based on **giddygiddyboy's public Mech Royale bot**, used under its MIT licence:
 
-- Source: https://github.com/justnau/giddygiddyboy-mech-royale (imported at commit `8b67d5b`, 2026-11-21)
+- Source: https://github.com/justnau/giddygiddyboy-mech-royale (imported at commit `8b67d5b`, 2026-11-21; `mech/brain.go` updated to upstream `e19e3c8`, taken from the MIT-licensed copy vendored in https://github.com/charliescull/mech-royale-bot under `drivers/giddy/`)
 - Licence: MIT, copyright (c) 2026 giddygiddyboy, kept in `LICENSE`
 - Our changes are listed in the git history after the import commit.
 
