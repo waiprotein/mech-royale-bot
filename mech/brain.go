@@ -1,6 +1,7 @@
 package mech
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"os"
@@ -340,6 +341,9 @@ func (b *Brain) Act(o *Obs) (act Action) {
 	defer func() {
 		if r := recover(); r != nil {
 			b.Panics++
+			if b.Panics <= 5 {
+				fmt.Fprintln(os.Stderr, "recover: panic", b.Panics, "at t =", o.T, ":", r)
+			}
 			a := b.lastAim
 			act = Action{Tick: o.Tick, Aim: &a}
 			if b.Panics >= 3 && !b.safeMode {
