@@ -42,6 +42,21 @@ func testObs(tick int, tm, hp float64, mechs ...MechSeen) *Obs {
 	return o
 }
 
+// TestWatchLast: idle, with a mech last seen 3 s ago 150 m north, the torso stays within ±0.9 rad of its bearing.
+func TestWatchLast(t *testing.T) {
+	north := MechSeen{ID: 5, Kind: "mech", Pos: Vec3{0, 150, 0}, Aim: [2]float64{0, 0}, HP: 1400, MaxHP: 1400, Weapons: []string{"gun"}}
+	b := testBrain(300, func(p *Params) { p.WatchLast = 8 })
+	var act Action
+	b.step(testObs(1, 100, 1400, north), &act)
+	for k, tm := range []float64{101, 102, 103} {
+		act = Action{}
+		b.step(testObs(2+k, tm, 1400), &act)
+		if act.Aim == nil || math.Abs(angDiff(act.Aim[0], math.Pi/2)) > 0.9+1e-9 {
+			t.Fatalf("watchlast at t=%v: aim %v, want within 0.9 rad of north", tm, act.Aim)
+		}
+	}
+}
+
 // TestRegenHide: at 40% HP with nobody in view, regenhide hides from a mech last seen 10 s ago (west of us, the
 // block is east), keeps hiding while HP is below 90%, and lets go at 90%. With the flag off nothing changes.
 func TestRegenHide(t *testing.T) {

@@ -289,6 +289,11 @@ type Params struct {
 	// delay). Released at 90% HP, after 30 s, when late or when ffaOn drops; a foe or a zoneShould move takes
 	// precedence while it holds. 0 = off.
 	RegenHide float64
+	// WatchLast [watchlast]: FFA-only (ffaOn). Idle aim (no target, nothing farmed, no engaged/hit-us mech to
+	// watch, no recent damage or facesound bearing): face the nearest mech seen in the last WatchLast s within
+	// 200 m with a ±0.9 rad (±52°) sweep, so it stays inside the 120° view wedge, instead of the walking sweep
+	// around the heading or the 3.5 rad/s standing spin. 0 = off.
+	WatchLast float64
 }
 
 func DefaultParams() Params {
@@ -1379,6 +1384,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 				}
 			}
 		}
+		var last *Track
+		if b.P.WatchLast > 0 && ffaOn && target == nil && farm == nil && farmPos == nil {
+			last = b.lastSeen(x, y) // watchlast
+		}
 		switch {
 		case watch != nil:
 			aim[0] = math.Atan2(watch.Pos[1]-y, watch.Pos[0]-x)
@@ -1389,6 +1398,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		case b.P.FaceSound && ffaOn && target == nil && farm == nil && farmPos == nil && now-b.soundAt < 1.5:
 			// facesound: FFA-only (!pracOn); below watch/npc/hurt bearings, above the walking scan.
 			aim[0] = b.soundBearing
+		case last != nil:
+			// watchlast: FFA-only; keep the last-seen mech in the 120° wedge with a ±52° sweep (above the scans).
+			aim[0] = math.Atan2(last.Pos[1]-y, last.Pos[0]-x) + 0.9*math.Sin(now*1.3)
 		case mx != 0 || my != 0:
 			aim[0] = math.Atan2(my, mx) + 1.15*math.Sin(now*1.3)
 		default:
@@ -2190,6 +2202,15 @@ func (b *Brain) recentMechs(x, y, s float64) []*Track {
 	return out
 }
 
+// lastSeen (watchlast) returns the nearest mech seen within the last WatchLast s whose current or last known
+// position is within 200 m of (x, y), or nil.
+func (b *Brain) lastSeen(x, y float64) *Track {
+	if r := b.recentMechs(x, y, b.P.WatchLast); len(r) > 0 && hyp(r[0].Pos[0]-x, r[0].Pos[1]-y) <= 200 {
+		return r[0]
+	}
+	return nil
+}
+
 func (b *Brain) dodge(o *Obs) (dx, dy float64, laser bool) {
 	me := &o.Self
 	cx, cy, cz := me.Pos[0], me.Pos[1], me.Pos[2]+me.Stats.Height*0.56
@@ -2420,7 +2441,7 @@ func squadParams(p Params) Params {
 	// Keep practice exactly as giddy tuned it: our FFA changes stay off.
 	p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp = 0, 0, 0, false
 	p.TPJoin, p.BackOpen, p.PreCharge, p.PeekCD = 0, 0, 0, 0
-	p.RegenHide = 0
+	p.RegenHide, p.WatchLast = 0, 0
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2651,6 +2672,8 @@ func applyFlags(p *Params, spec string) {
 			p.PeekCD = int(f)
 		case "regenhide":
 			p.RegenHide = f
+		case "watchlast":
+			p.WatchLast = f
 		}
 	}
 }
@@ -2757,7 +2780,7 @@ func (b *Brain) safeFallback() {
 		p.CrowdR, p.HomeFrac, p.GunOnlyR, p.LateAlive = 0, 0, 0, 3
 		p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp, p.Vulture = 0, 0, 0, false, 0
 		p.LateR, p.HoldOut = 70, 0
-		p.RegenHide = 0
+		p.RegenHide, p.WatchLast = 0, 0
 	}
 	off(&b.base)
 	b.regenOn = false
