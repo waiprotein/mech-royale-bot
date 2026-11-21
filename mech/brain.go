@@ -26,6 +26,8 @@ type Track struct {
 	// of ours in between (someone else is hurting it). TPAt / OppDist (tpjoin): last time the third-party join
 	// rule held for it, and the distance from it to the opponent it was fighting then.
 	HurtAt, TPAt, OppDist float64
+	// LOSAt (precharge): last time our muzzle had a clear line to it.
+	LOSAt float64
 }
 
 type known struct {
@@ -113,6 +115,9 @@ type Brain struct {
 	soundAt, soundBearing float64
 	// backopen: when we first held our opener on each mech id.
 	boWait map[int]float64
+	// peekcd (bit 2): id of the hidden foe whose laser we heard fire, and when its cooldown ends.
+	cdID    int
+	cdUntil float64
 }
 
 type Params struct {
@@ -260,6 +265,16 @@ type Params struct {
 	// laser charge, never start a charge it can see, and let a held charge go if it turns to see us. At most
 	// BackOpen s per target, then fire anyway. Fire returns at once when it hits us. 0 = off.
 	BackOpen float64
+	// PreCharge [precharge]: FFA-only (ffaOn). Charge or hold the laser for a hidden foe (no target in LOS) only
+	// while that foe had muzzle LOS within the last PreCharge s and is within 80 m. Otherwise no charge is
+	// started, and a held one is let go at once (its cooldown starts now) instead of being carried to giddy's
+	// 2.4 s release into cover. 0 = off (giddy: hold any hidden-foe charge to 2.4 s).
+	// PeekCD [peekcd]: FFA-only, bits. 1: while our laser is cooling down, do not step out to peek at a hidden
+	// foe. 2: when a laser shot is heard within 0.35 rad of a hidden laser-armed foe's bearing, step out for its
+	// 1.6 s cooldown and gun it (it cannot answer with the laser). 3 = both (2 wins when both apply). A visible
+	// mech charging at us still sends us back into cover.
+	PreCharge float64
+	PeekCD    int
 }
 
 func DefaultParams() Params {
@@ -371,7 +386,7 @@ func (b *Brain) observe(o *Obs) {
 		}
 		t := tab[m.ID]
 		if t == nil {
-			t = &Track{HitMe: -100, CalmAt: -100, HurtAt: -100, TPAt: -100}
+			t = &Track{HitMe: -100, CalmAt: -100, HurtAt: -100, TPAt: -100, LOSAt: -100}
 			tab[m.ID] = t
 		}
 		if b.P.TPJoin > 0 && m.Kind == "mech" && now-t.Seen <= 0.5 && m.HP < t.HP-20 {
@@ -396,6 +411,9 @@ func (b *Brain) observe(o *Obs) {
 		if !t.LOS && m.Kind == "mech" {
 			h := b.Cfg.Mech.Height * b.scaleOf(m.Cubes)
 			t.LOS = b.W.Clear(muzzle, Vec3{m.Pos[0], m.Pos[1], m.Pos[2] + h*0.85})
+		}
+		if t.LOS {
+			t.LOSAt = now
 		}
 		if t.Dist > 1 {
 			t.Closing = -((m.Vel[0]-me.Vel[0])*dx + (m.Vel[1]-me.Vel[1])*dy) / t.Dist
@@ -958,6 +976,23 @@ func (b *Brain) step(o *Obs, act *Action) {
 		if ready {
 			wantLos = 1
 		}
+		if b.P.PeekCD != 0 && ffaOn && target == nil {
+			// peekcd: 1 = no peek while our laser cools down; 2 = peek during the hidden foe's laser cooldown.
+			if b.P.PeekCD&1 != 0 && laser != nil && laser.Cooldown > 0.05 {
+				wantLos = -1
+			}
+			if b.P.PeekCD&2 != 0 && holds(foe.Weapons, "laser") {
+				fb := math.Atan2(foe.Pos[1]-y, foe.Pos[0]-x)
+				for _, s := range o.Sounds {
+					if s.Kind == "laser" && s.Dist != "far" && math.Abs(angDiff(s.Bearing, fb)) < 0.35 {
+						b.cdID, b.cdUntil = foe.ID, now-s.Age+1.6
+					}
+				}
+				if b.cdID == foe.ID && now < b.cdUntil {
+					wantLos = 1
+				}
+			}
+		}
 		if b.P.Peek && !hot {
 			for _, t := range seen {
 				if t.Seen == now && t.Charging && math.Abs(angDiff(t.Aim[0], math.Atan2(y-t.Pos[1], x-t.Pos[0]))) < 0.3 {
@@ -1288,6 +1323,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 
 		for i, w := range me.Weapons {
 			if w != nil && i < 2 && w.Kind == "laser" && w.Cooldown <= 0.05 && foe.Dist < w.Stats.Range && w.Charge < w.Stats.Charge+w.Stats.HoldS-0.35 {
+				if b.P.PreCharge > 0 && ffaOn && (now-foe.LOSAt > b.P.PreCharge || foe.Dist > 80) {
+					continue // precharge: no charge for a foe that left LOS long ago or is far; a held one is let go
+				}
 				act.Fire[i] = true
 			}
 		}
@@ -2327,7 +2365,7 @@ func squadParams(p Params) Params {
 	}
 	// Keep practice exactly as giddy tuned it: our FFA changes stay off.
 	p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp = 0, 0, 0, false
-	p.TPJoin, p.BackOpen = 0, 0
+	p.TPJoin, p.BackOpen, p.PreCharge, p.PeekCD = 0, 0, 0, 0
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2549,6 +2587,10 @@ func applyFlags(p *Params, spec string) {
 			p.TPHP = f
 		case "backopen":
 			p.BackOpen = f
+		case "precharge":
+			p.PreCharge = f
+		case "peekcd":
+			p.PeekCD = int(f)
 		}
 	}
 }
