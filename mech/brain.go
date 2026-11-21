@@ -2207,6 +2207,9 @@ func (b *Brain) beamCheck(o *Obs) {
 		if hyp(end[0]-me.Pos[0], end[1]-me.Pos[1]) < myR {
 			continue // aimed at us
 		}
+		if st := bm.Path[0]; math.Sqrt((end[0]-st[0])*(end[0]-st[0])+(end[1]-st[1])*(end[1]-st[1])+(end[2]-st[2])*(end[2]-st[2])) < 6 {
+			continue // stopped next to the shooter (a wall), not a fight
+		}
 		for i := range o.Mechs {
 			m := &o.Mechs[i]
 			if m.Kind != "mech" || m.ID == bm.By || m.ID == me.ID {
