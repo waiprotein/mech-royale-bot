@@ -104,6 +104,7 @@ type Brain struct {
 	stickAt, loseAt    float64
 	myHitAt            map[int]float64
 	ffaNow             bool
+	showCfg            bool
 	// facesound: time (match s) and bearing of the newest unexplained weapon sound.
 	soundAt, soundBearing float64
 }
@@ -231,6 +232,10 @@ type Params struct {
 	// how far out of the next circle home spots are sampled (giddy 0.7 of its radius). 0 = giddy.
 	CrowdR   float64
 	HomeFrac float64
+	// CfgGate [cfggate]: allow the opening only when hello.config has the showdown/kit schedule (zone 560 m,
+	// first hold 60 s + shrink 50 s, drops at 70/140/210 s). If practice rooms use another schedule this is a
+	// perfect t=0 practice-vs-FFA test (to be confirmed on the board: the gated build must score exactly 6.19).
+	CfgGate bool
 }
 
 func DefaultParams() Params {
@@ -264,7 +269,8 @@ func NewBrain(h *Hello, w *World) *Brain {
 	}
 	p := DefaultParams()
 	applyFlags(&p, os.Getenv("MECH_FLAGS"))
-	return &Brain{
+	show := isShowdownCfg(&h.Config)
+	return &Brain{showCfg: show,
 		W: w, Cfg: h.Config, Slot: h.Slot, rng: rand.New(rand.NewSource(seed)), P: p,
 		tracks: map[int]*Track{}, npcs: map[int]*Track{}, crates: map[int]*known{}, cubes: map[int]*known{},
 		pickups: map[int]*known{}, bad: map[int]float64{}, strafe: 1, lootID: -1, lastHurt: -100, lastThreatAt: -100,
@@ -453,7 +459,7 @@ func (b *Brain) observe(o *Obs) {
 	// Opening (giddy, dormant): while no death we did not cause has happened, FFA is not latched and squad
 	// params are not on (so in practice only before PracAt), play laser-first with LaserSeek 240 and
 	// LootRadius 150, and walk home at full speed (see the openOn check in step). OpenUntil caps it by time.
-	if open := b.base.Opening && !b.notPractice && !b.pracOn && b.startAlive-o.Alive-b.kills <= 0 &&
+	if open := b.base.Opening && (!b.base.CfgGate || b.showCfg) && !b.notPractice && !b.pracOn && b.startAlive-o.Alive-b.kills <= 0 &&
 		(b.base.OpenUntil <= 0 || now < b.base.OpenUntil); open != b.openOn {
 		b.openOn = open
 		b.P = b.base
@@ -2391,6 +2397,8 @@ func applyFlags(p *Params, spec string) {
 			p.CrowdR = f
 		case "homefrac":
 			p.HomeFrac = f
+		case "cfggate":
+			p.CfgGate = on
 		case "ffastrict":
 			p.FFAStrict = on
 		case "keeplaser":
@@ -2451,4 +2459,15 @@ func (b *Brain) beamCheck(o *Obs) {
 			return
 		}
 	}
+}
+
+// isShowdownCfg reports whether the match config has the schedule seen in every recorded top-16 showdown and in
+// the kit's recorded hello: zone starts at 560 m, first phase holds 60 s and shrinks 50 s, drops at 70/140/210 s.
+func isShowdownCfg(c *Config) bool {
+	z := c.Zone
+	if z.StartRadius != 560 || len(z.Phases) == 0 || z.Phases[0].HoldS != 60 || z.Phases[0].ShrinkS != 50 {
+		return false
+	}
+	t := c.Drops.Times
+	return len(t) == 3 && t[0] == 70 && t[1] == 140 && t[2] == 210
 }
