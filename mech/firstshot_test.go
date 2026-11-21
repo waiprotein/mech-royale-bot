@@ -57,6 +57,33 @@ func TestWatchLast(t *testing.T) {
 	}
 }
 
+// TestHomeLOS: the sightline penalty is 5 x homelos within 85 m of a recently seen mech, homelos at 85-200 m,
+// and nothing behind the block, beyond 200 m, or with the flag off.
+func TestHomeLOS(t *testing.T) {
+	west := MechSeen{ID: 5, Kind: "mech", Pos: Vec3{-50, 0, 0}, Aim: [2]float64{math.Pi / 2, 0}, HP: 1400, MaxHP: 1400, Weapons: []string{"gun"}}
+	for _, w := range []float64{0, 60} {
+		b := testBrain(10, func(p *Params) { p.HomeLOS = w })
+		o := testObs(1, 100, 1400, west)
+		var act Action
+		b.step(o, &act)
+		cases := []struct{ x, y, want float64 }{
+			{0, 0, 5 * w}, // 50 m, in sight
+			{0, 150, w},   // 158 m, in sight
+			{40, 0, 0},    // behind the block
+			{-50, 250, 0}, // 250 m
+		}
+		for _, c := range cases {
+			got := 0.0
+			if b.ffaNow && b.P.HomeLOS > 0 {
+				got = b.homeLOSCost(o, c.x, c.y)
+			}
+			if got != c.want {
+				t.Fatalf("homelos=%v at (%v,%v): cost %v, want %v", w, c.x, c.y, got, c.want)
+			}
+		}
+	}
+}
+
 // TestRegenHide: at 40% HP with nobody in view, regenhide hides from a mech last seen 10 s ago (west of us, the
 // block is east), keeps hiding while HP is below 90%, and lets go at 90%. With the flag off nothing changes.
 func TestRegenHide(t *testing.T) {

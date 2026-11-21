@@ -124,6 +124,11 @@ type Brain struct {
 	// regenhide: latched while regenerating in cover, and when the latch started.
 	regenOn bool
 	regenAt float64
+	// homelos: eyes of the recently seen mechs for this tick's home costs (valid while losTick == tick+1), and
+	// whether a fresh mech saw our home at the previous check.
+	losEyes []Vec3
+	losTick int
+	homeVis bool
 }
 
 type Params struct {
@@ -294,6 +299,12 @@ type Params struct {
 	// 200 m with a ±0.9 rad (±52°) sweep, so it stays inside the 120° view wedge, instead of the walking sweep
 	// around the heading or the 3.5 rad/s standing spin. 0 = off.
 	WatchLast float64
+	// HomeLOS [homelos]: FFA-only (ffaOn). homeCost adds, for each of the (up to 4, nearest us) mechs seen in the
+	// last 20 s whose eye has line of sight (W.Clear) to our eye height at the candidate spot, HomeLOS if it is
+	// 85-200 m from the spot and 5 x HomeLOS within 85 m (exchange rate from the calm-mech snapshots); giddy's
+	// static exposure term is unchanged. home/holdHome re-choose at once (not on the 12 s timer) when a mech seen
+	// this tick gains sight of the current home. At most 4 LOS checks per candidate. 0 = off.
+	HomeLOS float64
 }
 
 func DefaultParams() Params {
@@ -2142,16 +2153,85 @@ func (b *Brain) homeCost(o *Obs, px, py float64) float64 {
 		crowd += math.Max(0, 60-hyp(o.Drops[i].Pos[0]-px, o.Drops[i].Pos[1]-py)) / 60
 	}
 	edge := hyp(px-z.NextCenter[0], py-z.NextCenter[1]) / math.Max(30, z.NextRadius)
-	return b.P.HomeExpo*b.W.Exposure(px, py) + 0.25*hyp(px-o.Self.Pos[0], py-o.Self.Pos[1]) + 40*crowd + 10*edge
+	c := b.P.HomeExpo*b.W.Exposure(px, py) + 0.25*hyp(px-o.Self.Pos[0], py-o.Self.Pos[1]) + 40*crowd + 10*edge
+	if b.ffaNow && b.P.HomeLOS > 0 {
+		c += b.homeLOSCost(o, px, py) // homelos
+	}
+	return c
+}
+
+// homeLOSCost (homelos) is the sightline penalty for standing at (px, py): for each of up to 4 recently seen
+// mechs whose eye sees our eye height there, HomeLOS at 85-200 m and 5 x HomeLOS within 85 m.
+func (b *Brain) homeLOSCost(o *Obs, px, py float64) float64 {
+	spot := Vec3{px, py, b.W.WalkAt(px, py) + o.Self.Stats.EyeHeight}
+	c := 0.0
+	for _, e := range b.homeEyes(o) {
+		d := hyp(e[0]-px, e[1]-py)
+		if d > 200 || !b.W.Clear(e, spot) {
+			continue
+		}
+		if d < 85 {
+			c += 5 * b.P.HomeLOS
+		} else {
+			c += b.P.HomeLOS
+		}
+	}
+	return c
+}
+
+// homeEyes (homelos) returns the eyes of the 4 mechs seen in the last 20 s nearest us, cached per tick, which
+// caps a home re-choice at 4 LOS checks per candidate (40 + 1 candidates, 48 + 1 in holdHome).
+func (b *Brain) homeEyes(o *Obs) []Vec3 {
+	if b.losTick != o.Tick+1 {
+		b.losTick = o.Tick + 1
+		b.losEyes = b.losEyes[:0]
+		for _, t := range b.recentMechs(o.Self.Pos[0], o.Self.Pos[1], 20) {
+			if len(b.losEyes) == 4 {
+				break
+			}
+			b.losEyes = append(b.losEyes, b.eye(t))
+		}
+	}
+	return b.losEyes
+}
+
+// homeSeen (homelos) reports that a mech seen this tick (one of the 4 nearest the home spot, within 200 m) has
+// gained line of sight to our eye height at the current home, so home/holdHome re-choose at once. A gain right
+// after a re-choice (within 1 s) waits a tick, so a home that every spot's sightline covers is not re-chosen
+// every tick.
+func (b *Brain) homeSeen(o *Obs) bool {
+	if !b.ffaNow || b.P.HomeLOS <= 0 || !b.homeSet {
+		b.homeVis = false
+		return false
+	}
+	hx, hy := b.homeXY[0], b.homeXY[1]
+	spot := Vec3{hx, hy, b.W.WalkAt(hx, hy) + o.Self.Stats.EyeHeight}
+	vis := false
+	for i, t := range b.recentMechs(hx, hy, 0) {
+		if i == 4 || hyp(t.Pos[0]-hx, t.Pos[1]-hy) > 200 {
+			break
+		}
+		if b.W.Clear(b.eye(t), spot) {
+			vis = true
+			break
+		}
+	}
+	if vis && !b.homeVis && b.now-b.homeAt <= 1 {
+		return false
+	}
+	gained := vis && !b.homeVis
+	b.homeVis = vis
+	return gained
 }
 
 func (b *Brain) home(o *Obs) (float64, float64, bool) {
 	z := &o.Zone
+	force := b.homeSeen(o) // homelos: a fresh sightline onto home re-chooses at once (false when off)
 	if b.holdingOut(z, o.Alive) {
-		return b.holdHome(o)
+		return b.holdHome(o, force)
 	}
 	out := !b.homeSet || hyp(b.homeXY[0]-z.NextCenter[0], b.homeXY[1]-z.NextCenter[1]) > z.NextRadius*0.8
-	if out || b.now-b.homeAt > 12 {
+	if out || b.now-b.homeAt > 12 || force {
 		b.homeAt = b.now
 		best, bestC := [2]float64{}, math.Inf(1)
 		for k := 0; k < 40; k++ {
@@ -2441,7 +2521,7 @@ func squadParams(p Params) Params {
 	// Keep practice exactly as giddy tuned it: our FFA changes stay off.
 	p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp = 0, 0, 0, false
 	p.TPJoin, p.BackOpen, p.PreCharge, p.PeekCD = 0, 0, 0, 0
-	p.RegenHide, p.WatchLast = 0, 0
+	p.RegenHide, p.WatchLast, p.HomeLOS = 0, 0, 0
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2518,7 +2598,8 @@ func (b *Brain) holdingOut(z *Zone, alive int) bool {
 
 // holdHome picks a hidden spot inside the current circle, between HoldMin and HoldMin+25 m from the final
 // centre. The normal zone deadline logic (zoneMust) still pulls the bot in before the circle reaches it.
-func (b *Brain) holdHome(o *Obs) (float64, float64, bool) {
+// force (homelos) re-chooses at once.
+func (b *Brain) holdHome(o *Obs, force bool) (float64, float64, bool) {
 	z := &o.Zone
 	c := b.curZone(z)
 	minD := b.P.HoldMin
@@ -2529,7 +2610,7 @@ func (b *Brain) holdHome(o *Obs) (float64, float64, bool) {
 		d := hyp(px-z.NextCenter[0], py-z.NextCenter[1])
 		return d >= minD*0.8 && hyp(px-c.X, py-c.Y) <= c.R-12
 	}
-	if !b.homeSet || !valid(b.homeXY[0], b.homeXY[1]) || b.now-b.homeAt > 12 {
+	if !b.homeSet || !valid(b.homeXY[0], b.homeXY[1]) || b.now-b.homeAt > 12 || force {
 		b.homeAt = b.now
 		best, bestC := [2]float64{}, math.Inf(1)
 		for k := 0; k < 48; k++ {
@@ -2674,6 +2755,8 @@ func applyFlags(p *Params, spec string) {
 			p.RegenHide = f
 		case "watchlast":
 			p.WatchLast = f
+		case "homelos":
+			p.HomeLOS = f
 		}
 	}
 }
@@ -2780,7 +2863,7 @@ func (b *Brain) safeFallback() {
 		p.CrowdR, p.HomeFrac, p.GunOnlyR, p.LateAlive = 0, 0, 0, 3
 		p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp, p.Vulture = 0, 0, 0, false, 0
 		p.LateR, p.HoldOut = 70, 0
-		p.RegenHide, p.WatchLast = 0, 0
+		p.RegenHide, p.WatchLast, p.HomeLOS = 0, 0, 0
 	}
 	off(&b.base)
 	b.regenOn = false
