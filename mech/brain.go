@@ -236,6 +236,11 @@ type Params struct {
 	// first hold 60 s + shrink 50 s, drops at 70/140/210 s). If practice rooms use another schedule this is a
 	// perfect t=0 practice-vs-FFA test (to be confirmed on the board: the gated build must score exactly 6.19).
 	CfgGate bool
+	// CfgNoSquad [cfgnosquad]: with CfgGate, under the showdown schedule never switch to squad (practice) params.
+	// CfgFFA [cfgffa]: with CfgGate, under the showdown schedule treat the match as a proven FFA from t = 0, so
+	// the strict FFA features act at once instead of after the first unexplained death.
+	CfgNoSquad bool
+	CfgFFA     bool
 }
 
 func DefaultParams() Params {
@@ -449,7 +454,8 @@ func (b *Brain) observe(o *Obs) {
 	if b.base.PracAt > 0 {
 		pracAt = b.base.PracAt
 	}
-	if on := b.base.Practice && !b.notPractice && now > pracAt; on != b.pracOn {
+	noSquad := b.base.CfgGate && b.base.CfgNoSquad && b.showCfg
+	if on := b.base.Practice && !noSquad && !b.notPractice && now > pracAt; on != b.pracOn {
 		b.pracOn = on
 		b.P = b.base
 		if on {
@@ -618,7 +624,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 	b.now = o.T
 	now := o.T
 	b.observe(o)
-	ffaOn := !b.pracOn && (!b.P.FFAStrict || b.notPractice)
+	ffaOn := !b.pracOn && (!b.P.FFAStrict || b.notPractice || (b.P.CfgGate && b.P.CfgFFA && b.showCfg))
 	b.ffaNow = ffaOn
 	st := &me.Stats
 	x, y, zf := me.Pos[0], me.Pos[1], me.Pos[2]
@@ -2397,6 +2403,10 @@ func applyFlags(p *Params, spec string) {
 			p.CrowdR = f
 		case "homefrac":
 			p.HomeFrac = f
+		case "cfgnosquad":
+			p.CfgNoSquad = on
+		case "cfgffa":
+			p.CfgFFA = on
 		case "cfggate":
 			p.CfgGate = on
 		case "ffastrict":
@@ -2464,10 +2474,11 @@ func (b *Brain) beamCheck(o *Obs) {
 // isShowdownCfg reports whether the match config has the schedule seen in every recorded top-16 showdown and in
 // the kit's recorded hello: zone starts at 560 m, first phase holds 60 s and shrinks 50 s, drops at 70/140/210 s.
 func isShowdownCfg(c *Config) bool {
+	eq := func(a, b float64) bool { return math.Abs(a-b) < 1e-6 }
 	z := c.Zone
-	if z.StartRadius != 560 || len(z.Phases) == 0 || z.Phases[0].HoldS != 60 || z.Phases[0].ShrinkS != 50 {
+	if !eq(z.StartRadius, 560) || len(z.Phases) == 0 || !eq(z.Phases[0].HoldS, 60) || !eq(z.Phases[0].ShrinkS, 50) {
 		return false
 	}
 	t := c.Drops.Times
-	return len(t) == 3 && t[0] == 70 && t[1] == 140 && t[2] == 210
+	return len(t) == 3 && eq(t[0], 70) && eq(t[1], 140) && eq(t[2], 210)
 }
