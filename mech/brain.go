@@ -222,6 +222,10 @@ type Params struct {
 	// 60, below a cube's 75) in chooseLoot, so we go and swap it in. No effect under squad params (LaserSeek
 	// 240 already values it 150).
 	KeepLaser bool
+	// FFAStrict [ffastrict]: our FFA-only features (duelflee, lightlos, facesound, gunonlyout, lateal) act only after
+	// giddy's detector has proven a free-for-all (a death we did not cause). Practice play then stays identical to
+	// giddy e19e3c8 at salt 0 (6.19 on the board); other changes to practice play regress to ~5.5 (salt tests).
+	FFAStrict bool
 }
 
 func DefaultParams() Params {
@@ -235,6 +239,7 @@ func DefaultParams() Params {
 	// 60 s instead of 20 s, retreat stays allowed until the next circle is <= 25 m, and the end-game pile-up
 	// at the final centre is skipped until the zone forces the bot in.
 	p.PracAt = 20
+	p.FFAStrict = true
 	p.BeamFFA = false // practice-safe (S5 = 6.19) but -0.28 in the FFA sim (round 9); kept as a flag
 	p.LateR = 25
 	p.HoldOut = 368
@@ -602,6 +607,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 	b.now = o.T
 	now := o.T
 	b.observe(o)
+	ffaOn := !b.pracOn && (!b.P.FFAStrict || b.notPractice)
 	st := &me.Stats
 	x, y, zf := me.Pos[0], me.Pos[1], me.Pos[2]
 	z := &o.Zone
@@ -619,7 +625,11 @@ func (b *Brain) step(o *Obs, act *Action) {
 	if b.P.LateR > 0 {
 		lateR = b.P.LateR
 	}
-	late := z.NextRadius <= lateR || o.Alive <= b.P.LateAlive
+	lateAl := b.P.LateAlive
+	if !ffaOn {
+		lateAl = 3
+	}
+	late := z.NextRadius <= lateR || o.Alive <= lateAl
 
 	var seen []*Track
 	var target, hidden, shy *Track
@@ -748,7 +758,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 	finishing := target != nil && target.Dist < 120 && (target.HP < 200 || target.HP < me.HP*0.5)
 	_, myLaser := hasWeapon(me.Weapons, "laser")
 	outgunned := target != nil && holds(target.Weapons, "laser") && myLaser == nil && target.Dist > 55 && hpFrac < 0.8
-	if b.P.GunOnlyOut && gun != nil && light == nil && laser == nil {
+	if b.P.GunOnlyOut && ffaOn && gun != nil && light == nil && laser == nil {
 		if _, mortar := hasWeapon(me.Weapons, "mortar"); mortar == nil {
 			for _, t := range seen {
 				if t.Seen == now && (holds(t.Weapons, "laser") || holds(t.Weapons, "lightning")) {
@@ -763,7 +773,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 		b.oddsFleeUntil = now + 5
 	}
 	// duelflee: FFA-only (!pracOn); same flee latch as OddsFlee.
-	if b.P.DuelFlee > 0 && !b.pracOn && target != nil && !finishing && b.duelOdds(me, target) < b.P.DuelFlee {
+	if b.P.DuelFlee > 0 && ffaOn && target != nil && !finishing && b.duelOdds(me, target) < b.P.DuelFlee {
 		b.oddsFleeUntil = now + 5
 	}
 	if now < b.oddsFleeUntil && !finishing {
@@ -771,7 +781,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 	}
 	// lightlos: FFA-only (!pracOn). foe = target, else the hidden foe Peek would step out to; using it keeps us
 	// from peeking back into a laser's line once we have broken it.
-	if b.P.LightLOS && !b.pracOn && light != nil && laser == nil && foe != nil && !finishing &&
+	if b.P.LightLOS && ffaOn && light != nil && laser == nil && foe != nil && !finishing &&
 		holds(foe.Weapons, "laser") && foe.Dist > light.Stats.Range+5 {
 		swamped = true
 	}
@@ -1229,7 +1239,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 			aim[0] = b.npcBearing
 		case now-b.lastHurt < 2.5:
 			aim[0] = b.hurtBearing
-		case b.P.FaceSound && !b.pracOn && target == nil && farm == nil && farmPos == nil && now-b.soundAt < 1.5:
+		case b.P.FaceSound && ffaOn && target == nil && farm == nil && farmPos == nil && now-b.soundAt < 1.5:
 			// facesound: FFA-only (!pracOn); below watch/npc/hurt bearings, above the walking scan.
 			aim[0] = b.soundBearing
 		case mx != 0 || my != 0:
@@ -2351,6 +2361,8 @@ func applyFlags(p *Params, spec string) {
 			p.FaceSound = on
 		case "hunthide":
 			p.HuntHide = on
+		case "ffastrict":
+			p.FFAStrict = on
 		case "keeplaser":
 			p.KeepLaser = on
 		}
