@@ -186,6 +186,8 @@ func DefaultParams() Params {
 	// at the final centre is skipped until the zone forces the bot in.
 	p.PracAt = 20
 	p.BeamFFA = true
+	// Seek a laser up to 240 m outside practice mode too (giddy's squad value); real showdowns: lasers win at 50-95 m.
+	p.LaserSeek = 240
 	p.LateR = 25
 	p.HoldOut = 368
 	p.HoldMin = 60
