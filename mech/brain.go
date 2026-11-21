@@ -172,6 +172,13 @@ type Params struct {
 	// BeamFFA: treat a laser/lightning shot from one mech landing on another mech (not us) that lost HP as proof
 	// of a free-for-all (the practice squad never fights itself), and leave practice mode at once.
 	BeamFFA bool
+
+	// FFA experiments for the local sim. Every one is off by default (DefaultParams plays exactly as before);
+	// the MECH_FLAGS key is in brackets.
+	//
+	// OpenUntil [openuntil]: match time after which giddy's Opening switch [opening] turns off, even if no
+	// death we did not cause has happened yet (0 = no time cap, giddy's behaviour).
+	OpenUntil float64
 }
 
 func DefaultParams() Params {
@@ -382,7 +389,11 @@ func (b *Brain) observe(o *Obs) {
 			b.P = squadParams(b.base)
 		}
 	}
-	if open := b.base.Opening && !b.notPractice && !b.pracOn && b.startAlive-o.Alive-b.kills <= 0; open != b.openOn {
+	// Opening (giddy, dormant): while no death we did not cause has happened, FFA is not latched and squad
+	// params are not on (so in practice only before PracAt), play laser-first with LaserSeek 240 and
+	// LootRadius 150, and walk home at full speed (see the openOn check in step). OpenUntil caps it by time.
+	if open := b.base.Opening && !b.notPractice && !b.pracOn && b.startAlive-o.Alive-b.kills <= 0 &&
+		(b.base.OpenUntil <= 0 || now < b.base.OpenUntil); open != b.openOn {
 		b.openOn = open
 		b.P = b.base
 		if open {
@@ -2177,6 +2188,10 @@ func applyFlags(p *Params, spec string) {
 			p.DodgeBoost = f
 		case "threatboost":
 			p.ThreatBoost = f
+		case "opening":
+			p.Opening = on
+		case "openuntil":
+			p.OpenUntil = f
 		}
 	}
 }
