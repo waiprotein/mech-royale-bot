@@ -155,6 +155,11 @@ type Params struct {
 	LateR   float64
 	HoldOut float64
 	HoldMin float64
+	// FFAMin: deaths we did not cause needed before the bot decides it is not in practice (giddy: 1).
+	FFAMin float64
+	// SqLaserRange / SqFinish: practice-mode overrides for local tests (0 = giddy's 120 / 26).
+	SqLaserRange float64
+	SqFinish     float64
 }
 
 func DefaultParams() Params {
@@ -329,7 +334,11 @@ func (b *Brain) observe(o *Obs) {
 		b.base, b.baseSet = b.P, true
 		b.startAlive = o.Alive
 	}
-	if b.startAlive-o.Alive-b.kills > 0 {
+	ffaMin := 1
+	if b.P.FFAMin > 1 {
+		ffaMin = int(b.P.FFAMin)
+	}
+	if b.startAlive-o.Alive-b.kills >= ffaMin {
 		b.otherDead++
 	} else {
 		b.otherDead = 0
@@ -1954,6 +1963,12 @@ func squadParams(p Params) Params {
 	p.Finish = 20
 	p.Finish = 26
 
+	if p.SqLaserRange > 0 {
+		p.LaserRange = p.SqLaserRange
+	}
+	if p.SqFinish > 0 {
+		p.Finish = p.SqFinish
+	}
 	// Keep practice exactly as giddy tuned it: our FFA end-game changes stay off.
 	p.LateR = 70
 	p.HoldOut = 0
@@ -2062,6 +2077,12 @@ func applyFlags(p *Params, spec string) {
 			p.Practice = on
 		case "laserfirst":
 			p.LaserFirst = on
+		case "ffamin":
+			p.FFAMin = f
+		case "sqlaser":
+			p.SqLaserRange = f
+		case "sqfinish":
+			p.SqFinish = f
 		}
 	}
 }
