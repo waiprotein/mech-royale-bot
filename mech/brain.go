@@ -110,6 +110,7 @@ type Brain struct {
 	stickAt, loseAt    float64
 	myHitAt            map[int]float64
 	ffaNow             bool
+	safeMode           bool
 	exch               map[int]*exchange
 	showCfg            bool
 	// facesound: time (match s) and bearing of the newest unexplained weapon sound.
@@ -341,6 +342,9 @@ func (b *Brain) Act(o *Obs) (act Action) {
 			b.Panics++
 			a := b.lastAim
 			act = Action{Tick: o.Tick, Aim: &a}
+			if b.Panics >= 3 && !b.safeMode {
+				b.safeFallback()
+			}
 		}
 	}()
 	b.step(o, &act)
@@ -2691,4 +2695,23 @@ func (b *Brain) noteExchange(id int, byMe bool, now float64) {
 		ex.meFirst = byMe
 	}
 	ex.last = now
+}
+
+// safeFallback is the crash breaker: after 3 panics in a match it switches every one of our FFA additions off and
+// plays plain giddy for the rest of the match, so a bug in FFA-only code cannot leave us standing still.
+func (b *Brain) safeFallback() {
+	b.safeMode = true
+	off := func(p *Params) {
+		p.DuelFlee, p.TPJoin, p.BackOpen, p.PreCharge, p.PeekCD = 0, 0, 0, 0, 0
+		p.LightLOS, p.FaceSound, p.GunOnlyOut, p.KeepLaser, p.HuntHide, p.BeamFFA = false, false, false, false, false, false
+		p.CrowdR, p.HomeFrac, p.GunOnlyR, p.LateAlive = 0, 0, 0, 3
+		p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp, p.Vulture = 0, 0, 0, false, 0
+		p.LateR, p.HoldOut = 70, 0
+	}
+	off(&b.base)
+	if b.pracOn {
+		b.P = squadParams(b.base)
+	} else {
+		b.P = b.base
+	}
 }
