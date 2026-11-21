@@ -29,6 +29,8 @@ type Track struct {
 	HurtAt, TPAt, OppDist float64
 	// LOSAt (precharge): last time our muzzle had a clear line to it.
 	LOSAt float64
+	// LRAt (lrlaser): last time the long-range laser opener rule held for it.
+	LRAt float64
 }
 
 type known struct {
@@ -280,6 +282,20 @@ type Params struct {
 	// mech charging at us still sends us back into cover.
 	PreCharge float64
 	PeekCD    int
+	// LRLaser [lrlaser] / LRHP [lrhp] / LRKeep [lrkeep]: FFA-only (ffaOn). TigerTown27-style long-range laser
+	// opener (vault: Data/Rival TigerTown27.md, Gap review (Sat 23h).md). Engage a mech at EngageDist..LRLaser m
+	// (capped at MaxTarget, since a farther mech cannot be targeted) when: we hold a laser that is ready
+	// (cooldown <= 0.3 s), it is in view with LOS, it has not noticed us (aim more than 0.22 rad off us) or it is
+	// busy with another mech (tpOpp), it is not charging a laser at us (aim within 0.5 rad), our HP >= LRHP x its
+	// HP (0 = 1.0), we are not retreating, and at most 1 other mech is in view within 150 m of us. The rule is held
+	// 1.5 s (aim flicker), then for 4 s after each of our hits on it while our HP still beats LRHP x its HP and it
+	// is within range (follow-through: once hit it turns to us and giddy's rule alone would drop it). The normal
+	// fire code opens with the gun at once and charges the laser in parallel, then releases the full charge on aim
+	// (its cap is the weapon's own range x 0.97, not LaserRange). LRKeep: while fighting with a laser held, the
+	// preferred laser distance is max(LaserRange, LRKeep) instead of giddy's 85 m. 0 = off.
+	LRLaser float64
+	LRHP    float64
+	LRKeep  float64
 }
 
 func DefaultParams() Params {
@@ -397,11 +413,11 @@ func (b *Brain) observe(o *Obs) {
 		}
 		t := tab[m.ID]
 		if t == nil {
-			t = &Track{HitMe: -100, CalmAt: -100, HurtAt: -100, TPAt: -100, LOSAt: -100}
+			t = &Track{HitMe: -100, CalmAt: -100, HurtAt: -100, TPAt: -100, LOSAt: -100, LRAt: -100}
 			tab[m.ID] = t
 		}
-		if b.P.TPJoin > 0 && m.Kind == "mech" && now-t.Seen <= 0.5 && m.HP < t.HP-20 {
-			// tpjoin: it lost HP since our last sighting and none of our hits landed after that sighting.
+		if (b.P.TPJoin > 0 || b.P.LRLaser > 0) && m.Kind == "mech" && now-t.Seen <= 0.5 && m.HP < t.HP-20 {
+			// tpjoin / lrlaser (busy test via tpOpp): it lost HP since our last sighting and none of our hits landed after that sighting.
 			if at, ok := b.myHitAt[m.ID]; !ok || at <= t.Seen {
 				t.HurtAt = now
 			}
@@ -777,6 +793,18 @@ func (b *Brain) step(o *Obs, act *Action) {
 					t.Engage = true
 				}
 			}
+			// lrlaser: FFA-only. TigerTown27-style long-range opener with a ready laser (see LRLaser).
+			if b.P.LRLaser > 0 && ffaOn && !t.Engage {
+				if b.lrOpen(o, me, t, laser, aimed, off, maxT) {
+					t.LRAt = now
+				}
+				hit, ok := b.myHitAt[t.ID]
+				follow := ok && now-hit < 4 && now-t.LRAt < 12 && me.HP >= b.lrHP()*t.HP &&
+					t.Dist <= math.Min(b.P.LRLaser, maxT) && !b.retreat
+				if now-t.LRAt < 1.5 || follow {
+					t.Engage = true
+				}
+			}
 		case b.P.AllFoes && t.Dist < maxT:
 			t.Engage = true
 		case t.Dist < b.P.EngageDist, now-t.HitMe < 6, late:
@@ -1023,7 +1051,11 @@ func (b *Brain) step(o *Obs, act *Action) {
 				boost = true
 			}
 		} else {
+			if b.P.LRLaser > 0 && b.P.LRKeep > 0 && ffaOn && laser != nil {
+				b.P.LaserRange = math.Max(b.P.LaserRange, b.P.LRKeep) // lrkeep: fight from long laser range
+			}
 			mx, my = b.fightMove(o, foe, seen, wantLos)
+			b.P = keep
 		}
 		if light != nil && foe.Dist > 50 && me.Energy > 55 && wantLos > 0 {
 			boost = true
@@ -2343,6 +2375,44 @@ func (b *Brain) tpOpp(o *Obs, t *Track) (*Track, float64) {
 	return opp, od
 }
 
+// lrHP (lrlaser) is the HP ratio we need over a mech before opening on it at long range (LRHP, 0 = 1.0).
+func (b *Brain) lrHP() float64 {
+	if b.P.LRHP > 0 {
+		return b.P.LRHP
+	}
+	return 1
+}
+
+// lrOpen (lrlaser) reports whether to open on t at long range with the laser (see LRLaser). aimed and off are
+// giddy's test of t's aim at us (within 0.22 rad) and that aim error in rad.
+func (b *Brain) lrOpen(o *Obs, me *Self, t *Track, laser *WeaponState, aimed bool, off, maxT float64) bool {
+	if laser == nil || laser.Cooldown > 0.3 || t.Seen != b.now || !t.LOS || b.retreat || b.now < b.oddsFleeUntil {
+		return false
+	}
+	if t.Dist < b.P.EngageDist || t.Dist > math.Min(b.P.LRLaser, maxT) || me.HP < b.lrHP()*t.HP {
+		return false
+	}
+	if t.Charging && off < 0.5 {
+		return false // charging a laser at us (a wider cone than "aimed": it can swing that far before release)
+	}
+	others := 0
+	for _, u := range b.tracks {
+		if u != t && u.Seen == b.now && u.Dist < 150 {
+			others++
+		}
+	}
+	if others > 1 {
+		return false // crowd: keep out of three-way fights
+	}
+	if aimed {
+		// It has noticed us: open only while it is busy with another mech.
+		if opp, _ := b.tpOpp(o, t); opp == nil {
+			return false
+		}
+	}
+	return true
+}
+
 func squadParams(p Params) Params {
 	p.Ghost = false
 	p.Peek = false
@@ -2377,6 +2447,7 @@ func squadParams(p Params) Params {
 	// Keep practice exactly as giddy tuned it: our FFA changes stay off.
 	p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp = 0, 0, 0, false
 	p.TPJoin, p.BackOpen, p.PreCharge, p.PeekCD = 0, 0, 0, 0
+	p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2605,6 +2676,12 @@ func applyFlags(p *Params, spec string) {
 			p.PreCharge = f
 		case "peekcd":
 			p.PeekCD = int(f)
+		case "lrlaser":
+			p.LRLaser = f
+		case "lrhp":
+			p.LRHP = f
+		case "lrkeep":
+			p.LRKeep = f
 		}
 	}
 }
@@ -2711,6 +2788,7 @@ func (b *Brain) safeFallback() {
 		p.CrowdR, p.HomeFrac, p.GunOnlyR, p.LateAlive = 0, 0, 0, 3
 		p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp, p.Vulture = 0, 0, 0, false, 0
 		p.LateR, p.HoldOut = 70, 0
+		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 	}
 	off(&b.base)
 	if b.pracOn {
