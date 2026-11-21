@@ -1,0 +1,4 @@
+# Keep LF endings in the repo and the working tree (the image is built on Linux).
+* text=auto eol=lf
+*.gz binary
+*.i16 binary

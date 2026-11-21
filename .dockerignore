@@ -1,0 +1,19 @@
+# Keep the image context to what the bot needs at runtime.
+.git
+.gitignore
+.gitattributes
+.dockerignore
+tools/
+logs/
+replays/
+tmp/
+*.log
+*.jsonl
+*.jsonl.gz
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+.idea/
+README.md
