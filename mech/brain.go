@@ -111,6 +111,8 @@ type Brain struct {
 	showCfg            bool
 	// facesound: time (match s) and bearing of the newest unexplained weapon sound.
 	soundAt, soundBearing float64
+	// backopen: when we first held our opener on each mech id.
+	boWait map[int]float64
 }
 
 type Params struct {
@@ -252,6 +254,12 @@ type Params struct {
 	// out, so its nearest-first targeting stays on the opponent. 0 = off; the value is the margin in m.
 	TPJoin float64
 	TPHP   float64
+	// BackOpen [backopen]: FFA-only (ffaOn). On a fresh opener (it has not hit us within 6 s, we have not hit it
+	// within 8 s, it is beyond its all-round vision ring + 2 m, not charging, our HP > 60%), hold gun and laser
+	// fire until its aim is more than 90° + 0.15 rad off us (back turned and blind to us). Meanwhile keep a full
+	// laser charge, never start a charge it can see, and let a held charge go if it turns to see us. At most
+	// BackOpen s per target, then fire anyway. Fire returns at once when it hits us. 0 = off.
+	BackOpen float64
 }
 
 func DefaultParams() Params {
@@ -1252,6 +1260,22 @@ func (b *Brain) step(o *Obs, act *Action) {
 					ep := math.Max(0, math.Abs(mp-me.Aim[1])-st.PitchRate*0.05)
 					if ey < 0.04 && ep < 0.03 {
 						act.Fire[i] = true
+					}
+				}
+			}
+		}
+		if isMech && b.P.BackOpen > 0 && ffaOn {
+			if hold, sees := b.backHold(me, target, hpFrac, laser != nil && laser.Charge > 0); hold {
+				// backopen: hold the opener for its back (see backHold); aim and tracking are unchanged.
+				for i, w := range me.Weapons {
+					switch {
+					case w == nil || i > 1:
+					case w.Kind == "gun":
+						act.Fire[i] = false
+					case w.Kind == "laser" && w.Charge >= w.Stats.Charge-0.051:
+						act.Fire[i] = true // keep the full charge (it fires on its own only hold_s after full)
+					case w.Kind == "laser" && w.Charge <= 0 && sees:
+						act.Fire[i] = false // never show it a charge
 					}
 				}
 			}
@@ -2303,7 +2327,7 @@ func squadParams(p Params) Params {
 	}
 	// Keep practice exactly as giddy tuned it: our FFA changes stay off.
 	p.FightBoost, p.DodgeBoost, p.ThreatBoost, p.SpeedUp = 0, 0, 0, false
-	p.TPJoin = 0
+	p.TPJoin, p.BackOpen = 0, 0
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2332,6 +2356,44 @@ func (b *Brain) showsBack(t *Track, x, y float64) bool {
 		arc = 180
 	}
 	return math.Abs(angDiff(t.Aim[0], math.Atan2(y-t.Pos[1], x-t.Pos[0]))) > arc*math.Pi/360+0.1
+}
+
+// backHold (backopen) reports whether to hold our opening fire on t, and whether t may see us (inside its view
+// wedge + 0.1 rad and range). A fresh opener is held until t's aim is more than 90° + 0.15 rad off us, for at
+// most BackOpen s per target (timer per mech id, restarted after BackOpen + 8 s). A held laser charge is let go
+// as soon as t may see us, before it can dodge or answer.
+func (b *Brain) backHold(me *Self, t *Track, hpFrac float64, charging bool) (hold, sees bool) {
+	now := b.now
+	near, fov, vr := b.Cfg.Vision.NearRange, b.Cfg.Vision.FovDeg, b.Cfg.Vision.Range
+	if near <= 0 {
+		near = 45
+	}
+	if fov <= 0 {
+		fov = 120
+	}
+	if vr <= 0 {
+		vr = 200
+	}
+	if now-t.HitMe < 6 || t.Charging || hpFrac <= 0.6 || t.Dist <= near+2 {
+		return false, false
+	}
+	if at, ok := b.myHitAt[t.ID]; ok && now-at < 8 {
+		return false, false
+	}
+	off := math.Abs(angDiff(t.Aim[0], math.Atan2(me.Pos[1]-t.Pos[1], me.Pos[0]-t.Pos[0])))
+	sees = off < fov*math.Pi/360+0.1 && t.Dist < vr+10
+	if off > math.Pi/2+0.15 || (sees && charging) {
+		return false, sees
+	}
+	if b.boWait == nil {
+		b.boWait = map[int]float64{}
+	}
+	ws, ok := b.boWait[t.ID]
+	if !ok || now-ws > b.P.BackOpen+8 {
+		ws = now
+		b.boWait[t.ID] = ws
+	}
+	return now-ws < b.P.BackOpen, sees
 }
 
 // holdingOut reports whether a ghost should stay away from the final circle's centre for now.
@@ -2485,6 +2547,8 @@ func applyFlags(p *Params, spec string) {
 			p.TPJoin = f
 		case "tphp":
 			p.TPHP = f
+		case "backopen":
+			p.BackOpen = f
 		}
 	}
 }
