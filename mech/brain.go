@@ -110,6 +110,7 @@ type Brain struct {
 	stickAt, loseAt    float64
 	myHitAt            map[int]float64
 	ffaNow             bool
+	exch               map[int]*exchange
 	showCfg            bool
 	// facesound: time (match s) and bearing of the newest unexplained weapon sound.
 	soundAt, soundBearing float64
@@ -243,6 +244,8 @@ type Params struct {
 	// how far out of the next circle home spots are sampled (giddy 0.7 of its radius). 0 = giddy.
 	CrowdR   float64
 	HomeFrac float64
+	// GunOnlyR [gunonlyr]: with GunOnlyOut, only armed mechs closer than this count (0 = any range).
+	GunOnlyR float64
 	// CfgGate [cfggate]: allow the opening only when hello.config has the showdown/kit schedule (zone 560 m,
 	// first hold 60 s + shrink 50 s, drops at 70/140/210 s). If practice rooms use another schedule this is a
 	// perfect t=0 practice-vs-FFA test (to be confirmed on the board: the gated build must score exactly 6.19).
@@ -837,7 +840,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 	if b.P.GunOnlyOut && ffaOn && gun != nil && light == nil && laser == nil {
 		if _, mortar := hasWeapon(me.Weapons, "mortar"); mortar == nil {
 			for _, t := range seen {
-				if t.Seen == now && (holds(t.Weapons, "laser") || holds(t.Weapons, "lightning")) {
+				if t.Seen == now && (b.P.GunOnlyR <= 0 || t.Dist < b.P.GunOnlyR) && (holds(t.Weapons, "laser") || holds(t.Weapons, "lightning")) {
 					outgunned = true
 					break
 				}
@@ -1458,7 +1461,7 @@ func (b *Brain) wantPickup(me *Self, kind string) bool {
 		return false
 	}
 	rank := func(k string) int {
-		if (b.P.LaserFirst || b.P.KeepLaser) && k == "laser" {
+		if (b.P.LaserFirst || (b.P.KeepLaser && b.ffaNow)) && k == "laser" {
 			return 4
 		}
 		return weaponRank[k]
@@ -1996,7 +1999,7 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 			if seek {
 				v = math.Max(v, 150)
 			}
-			if b.P.KeepLaser && p.Kind == "laser" {
+			if b.P.KeepLaser && b.ffaNow && p.Kind == "laser" {
 				if _, l := hasWeapon(me.Weapons, "lightning"); l != nil {
 					v = math.Max(v, 150) // keeplaser: swap held lightning for a laser in reach
 				}
@@ -2288,8 +2291,8 @@ func (b *Brain) duelOdds(me *Self, t *Track) float64 {
 		return 0
 	}
 	hpMe, hpThem := math.Max(me.HP, 1), math.Max(t.HP, 1)
-	if b.now-t.HitMe < 4 {
-		// t shot first: its back-turned term refers to us (our aim away from t).
+	if ex := b.exch[t.ID]; ex != nil && b.now-ex.last < 6 && !ex.meFirst {
+		// t shot first in the current exchange: its back-turned term refers to us (our aim away from t).
 		toT := math.Atan2(t.Pos[1]-me.Pos[1], t.Pos[0]-me.Pos[0])
 		meBack := math.Abs(angDiff(me.Aim[0], toT)) > math.Pi/2
 		z := 0.94 + 4.0*math.Log(hpThem/hpMe) + 0.74*ind(themLaser) - 1.19*ind(meLaser) + 0.68*ind(meBack)
@@ -2420,7 +2423,8 @@ func (b *Brain) backHold(me *Self, t *Track, hpFrac float64, charging bool) (hol
 	}
 	off := math.Abs(angDiff(t.Aim[0], math.Atan2(me.Pos[1]-t.Pos[1], me.Pos[0]-t.Pos[0])))
 	sees = off < fov*math.Pi/360+0.1 && t.Dist < vr+10
-	if off > math.Pi/2+0.15 || (sees && charging) {
+	if off > math.Pi/2+0.15 || sees {
+		// Back turned: fire now. Target can see us: holding would hand it the first shot, so fire too.
 		return false, sees
 	}
 	if b.boWait == nil {
@@ -2567,6 +2571,8 @@ func applyFlags(p *Params, spec string) {
 			p.FaceSound = on
 		case "hunthide":
 			p.HuntHide = on
+		case "gunonlyr":
+			p.GunOnlyR = f
 		case "crowdr":
 			p.CrowdR = f
 		case "homefrac":
@@ -2603,9 +2609,16 @@ func (b *Brain) beamCheck(o *Obs) {
 	if b.myHitAt == nil {
 		b.myHitAt = map[int]float64{}
 	}
+	if b.exch == nil {
+		b.exch = map[int]*exchange{}
+	}
 	for _, e := range o.Events {
 		if e.Type == "hit" {
 			b.myHitAt[e.Target] = o.T
+			b.noteExchange(e.Target, true, o.T)
+		}
+		if e.Type == "damaged" && e.By != nil {
+			b.noteExchange(*e.By, false, o.T)
 		}
 	}
 	if !b.P.BeamFFA || b.notPractice || len(o.Beams) == 0 {
@@ -2659,4 +2672,23 @@ func isShowdownCfg(c *Config) bool {
 	}
 	t := c.Drops.Times
 	return len(t) == 3 && eq(t[0], 70) && eq(t[1], 140) && eq(t[2], 210)
+}
+
+// exchange records who opened the current exchange of fire with one mech (an exchange ends after 6 s without
+// hits either way). duelOdds uses it to pick the first-shooter side of the duel model.
+type exchange struct {
+	last    float64
+	meFirst bool
+}
+
+func (b *Brain) noteExchange(id int, byMe bool, now float64) {
+	ex := b.exch[id]
+	if ex == nil {
+		ex = &exchange{last: -100}
+		b.exch[id] = ex
+	}
+	if now-ex.last > 6 {
+		ex.meFirst = byMe
+	}
+	ex.last = now
 }
