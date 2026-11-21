@@ -14,6 +14,8 @@ The protocol itself comes from the organiser's `mechfight-kit` (`protocol.md`).
 
 ## What we changed (our own work, on top of giddy's base)
 
+In numbers (Sun 22 Nov): about **1,000 of the 2,983 lines in `mech/brain.go` are ours** (giddy's base file had ~2,000), plus ~460 lines of our tests and test tooling (`mech/*_test.go`, `cmd/wasmbot`), over 38 commits after the import. `mech/world.go` (map, line of sight, paths) and `mech/types.go` are giddy's, essentially unchanged. In the final our free-for-all logic below takes over after the bot has proven it is in a free-for-all; in practice matches against the house squad it deliberately plays like giddy's base.
+
 All in `mech/brain.go` unless noted; see the git history for every step.
 
 - **Free-for-all detection and strict gating (`FFAStrict`).** Our FFA behaviours switch on only after the bot has proven it is in a free-for-all (a death it did not cause), so they never act against the practice house squad.
