@@ -566,6 +566,12 @@ type Params struct {
 	// ghost play (before PracAt, after CautiousT) and FFA play unchanged. 0 = off (suggested 80, from the practice
 	// sweep's engage=80).
 	SqEngage float64
+	// SqHunt [sqhunt]: SQUAD MODE ONLY (pracOn). Practice points ~ house bots we kill (rival survey K2, mechanics
+	// only). Engage any mech seen within SqHunt m while our HP > 60% and our odds (HP x damage multiplier, ours over
+	// its) >= 0.7; pick the nearest (target score = distance; giddy's HP term dropped, Stick and the hit-us bonus
+	// kept); with no target in LOS, walk to the nearest such hidden mech; with only the gun (no laser/lightning),
+	// fight it from 18-42 m (preferred range = its distance clamped to that band). 0 = off.
+	SqHunt float64
 	// KiteBoost [kiteboost]: PRACTICE-side (only while !ffaOn). The house squad walks in to its own short range, where
 	// it hits us far more (sim traces: a visible house bot deals ~56 HP/s at 30-50 m, ~17 at 70-90 m, ~8 at
 	// 110-140 m) while our own damage holds up with range (laser exchange ratio ~2 at 30-50 m, 7-9 at 110-180 m).
@@ -1165,6 +1171,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 				t.Engage = true
 			}
 		}
+		if b.sqHuntOK(me, t, hpFrac) {
+			t.Engage = true // sqhunt: hunt close in squad mode
+		}
 		if b.P.LCDPunish > 0 && !ffaOn && t.Kind == "mech" && holds(t.Weapons, "laser") {
 			// lcdpunish: punish the laser's cooldown, do not open into a ready laser (see LCDPunish).
 			if b.lcdWindow(t) && me.HP >= t.HP && t.LOS && t.Dist < b.reach(me) {
@@ -1186,6 +1195,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 			continue
 		}
 		s := t.Dist + hpw*t.HP
+		if b.P.SqHunt > 0 && b.pracOn {
+			s = t.Dist // sqhunt: nearest first, no HP term
+		}
 		if b.P.LowBonus > 0 && t.HP <= 0.3*t.MaxHP {
 			s -= b.P.LowBonus
 		}
@@ -1220,6 +1232,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 	foe := target
 	if foe == nil && b.P.Peek {
 		foe = hidden
+	}
+	if foe == nil && hidden != nil && b.sqHuntOK(me, hidden, hpFrac) {
+		foe = hidden // sqhunt: walk to the nearest huntable mech out of sight
 	}
 	if foe == nil && b.P.Pursue > 0 && hidden != nil && hidden.HP < b.P.Pursue*hidden.MaxHP {
 		foe = hidden
@@ -2193,6 +2208,31 @@ func (b *Brain) travel(me *Self, gx, gy float64) (float64, float64) {
 	return unit(gx, gy)
 }
 
+// sqHuntOK (sqhunt) reports whether t is a huntable mech in squad mode: seen in the last 2.5 s within SqHunt m,
+// our HP > 60% and (our HP x our damage multiplier) / (its HP x its) >= 0.7. The damage multiplier is the cube bonus
+// (damage_per_cube, capped at stat_cap) x 1.5 when a laser or lightning is held.
+func (b *Brain) sqHuntOK(me *Self, t *Track, hpFrac float64) bool {
+	if b.P.SqHunt <= 0 || !b.pracOn || t.Kind != "mech" || b.now-t.Seen > 2.5 || hpFrac <= 0.6 || t.HP <= 0 {
+		return false
+	}
+	if hyp(t.Pos[0]-me.Pos[0], t.Pos[1]-me.Pos[1]) > b.P.SqHunt {
+		return false
+	}
+	mult := func(cubes int, armed bool) float64 {
+		c := math.Min(float64(cubes), math.Max(1, float64(b.Cfg.Cubes.StatCap)))
+		m := 1 + b.Cfg.Cubes.DamagePerCube*c
+		if armed {
+			m *= 1.5
+		}
+		return m
+	}
+	_, ml := hasWeapon(me.Weapons, "laser")
+	_, mg := hasWeapon(me.Weapons, "lightning")
+	ours := me.HP * mult(me.Cubes, ml != nil || mg != nil)
+	theirs := t.HP * mult(t.Cubes, holds(t.Weapons, "laser") || holds(t.Weapons, "lightning"))
+	return ours >= 0.7*theirs
+}
+
 func (b *Brain) prefRange(me *Self, t *Track) float64 {
 	_, light := hasWeapon(me.Weapons, "lightning")
 	_, laser := hasWeapon(me.Weapons, "laser")
@@ -2216,6 +2256,9 @@ func (b *Brain) prefRange(me *Self, t *Track) float64 {
 	}
 	if b.P.TPJoin > 0 && b.ffaNow && b.now-t.TPAt < 1.5 {
 		r = math.Max(r, t.OppDist+b.P.TPJoin) // tpjoin: stay the farther attacker
+	}
+	if b.P.SqHunt > 0 && b.pracOn && t.Kind == "mech" && laser == nil && light == nil {
+		r = math.Max(18, math.Min(42, t.Dist)) // sqhunt: gun fights from 18-42 m
 	}
 	if b.P.LCDPunish > 0 && !b.ffaNow && b.lcdWindow(t) && me.HP >= t.HP {
 		r = math.Min(r, 50) // lcdpunish: close in while its laser cools down
@@ -4046,6 +4089,8 @@ func applyFlags(p *Params, spec string) {
 			p.SqSpeed = on
 		case "sqdodge":
 			p.SqDodge = f
+		case "sqhunt":
+			p.SqHunt = f
 		case "sqengage":
 			p.SqEngage = f
 		case "threatboost":
@@ -4326,6 +4371,7 @@ func (b *Brain) safeFallback() {
 		p.Arm, p.Scan, p.CubePush, p.ArmFirst = false, 0, 0, false
 		p.SqRim, p.SqLootIn, p.SqBand, p.SqRet = 0, 0, false, 0
 		p.SqSpeed, p.SqDodge, p.SqEngage = false, 0, 0
+		p.SqHunt = 0
 		p.ArmBoost, p.SqJink = false, false
 	}
 	off(&b.base)
