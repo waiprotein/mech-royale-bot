@@ -350,6 +350,17 @@ type Params struct {
 	// us, and while a mech is (or may still be) holding a charge aimed at us we break its line with coverMove if the
 	// cover spot is within this many metres, holding it until the charge resolves. 0 = off. (Port of lab/laserlos.)
 	LaserLOS float64
+	// RearAvoid [rearavoid]: PRACTICE / PRE-LATCH ONLY (acts while !ffaOn, so the post-latch FFA brain is unchanged).
+	// Hits from outside the 180° front arc (centred on torso aim yaw) do x1.5 (mech.rear_mult). (1) fightMove
+	// subtracts this weight per other mech we saw this tick within 170 m, with line of sight to the candidate spot,
+	// that would sit outside our front arc while we aim at the target from there. (2) With no aim target, the idle
+	// aim turns to the nearest mech seen this tick within 150 m that is outside our current front arc. 0 = off.
+	RearAvoid float64
+	// CoverReload [coverreload]: PRACTICE / PRE-LATCH ONLY (!ffaOn). While no weapon can fire (gun empty or
+	// reloading with > 0.3 s left, laser absent or cooling with > 0.3 s left, lightning absent or out of
+	// range/energy for the target), take cover (coverMove) from the mechs seen this tick with line of sight,
+	// instead of standing in the open; not while finishing a target. false = off.
+	CoverReload bool
 	// FFADrops [ffadrops]: FFA-only (ffaOn). Conditional supply-drop capture through giddy's dormant drop path (the
 	// UseDrops branches of chooseLoot, same values and the same "reachable before landing + 25 s" test). The value
 	// is the farthest drop we go for, in m (0 = off). Only the first two drops of the match (called at 70 and
@@ -1159,6 +1170,11 @@ func (b *Brain) step(o *Obs, act *Action) {
 		// laserlos: break (and hold) the line of every laser charge aimed at us when cover is close enough.
 		boost = me.Energy > 20 && (mx != 0 || my != 0)
 		mode = "lasercover"
+	case b.P.CoverReload && !ffaOn && !finishing && !b.canFire(me, gun, laser, light, target) &&
+		b.coverMove(o, losNow(seen, now), &mx, &my):
+		// coverreload (practice / pre-latch only): nothing can fire, so hide from the mechs that see us.
+		boost = me.Energy > 20 && (mx != 0 || my != 0)
+		mode = "reloadcover"
 	case chargeFoe != nil && !finishing && !(chargeFoe.LOS && laser != nil && laser.Charge >= laser.Stats.Charge-0.3 &&
 		chargeFoe.Dist <= laser.Stats.Range-5) && b.coverMove(o, seen, &mx, &my):
 		// chargeengage: no hot laser on the long-range charger, so break its line (coverMove) instead of fighting.
@@ -1564,9 +1580,20 @@ func (b *Brain) step(o *Obs, act *Action) {
 		if b.P.WatchLast > 0 && ffaOn && target == nil && farm == nil && farmPos == nil {
 			last = b.lastSeen(x, y) // watchlast
 		}
+		var rearT *Track // rearavoid (practice / pre-latch only): nearest seen mech behind our front arc
+		if b.P.RearAvoid > 0 && !ffaOn {
+			for _, t := range seen {
+				if t.Seen == now && t.Dist < 150 && math.Abs(angDiff(me.Aim[0], math.Atan2(t.Pos[1]-y, t.Pos[0]-x))) > math.Pi/2 &&
+					(rearT == nil || t.Dist < rearT.Dist) {
+					rearT = t
+				}
+			}
+		}
 		switch {
 		case watch != nil:
 			aim[0] = math.Atan2(watch.Pos[1]-y, watch.Pos[0]-x)
+		case rearT != nil:
+			aim[0] = math.Atan2(rearT.Pos[1]-y, rearT.Pos[0]-x)
 		case b.npcHurt > 0 && now-b.npcHurt < 2.5:
 			aim[0] = b.npcBearing
 		case now-b.lastHurt < 2.5:
@@ -1938,12 +1965,18 @@ func (b *Brain) fightMove(o *Obs, tg *Track, seen []*Track, wantLos float64) (fl
 			}
 		}
 		body := Vec3{cx, cy, cz + me.Stats.Height*0.6}
+		toTg := math.Atan2(tg.Pos[1]-cy, tg.Pos[0]-cx)
 		for _, e := range seen {
 			if e == tg || hyp(e.Pos[0]-cx, e.Pos[1]-cy) > 170 {
 				continue
 			}
 			if b.W.Clear(b.eye(e), body) {
 				s -= 30
+				// rearavoid (practice / pre-latch only): aiming at tg from here leaves e in our rear arc (x1.5).
+				if b.P.RearAvoid > 0 && !b.ffaNow && e.Seen == b.now &&
+					math.Abs(angDiff(math.Atan2(e.Pos[1]-cy, e.Pos[0]-cx), toTg)) > math.Pi/2 {
+					s -= b.P.RearAvoid
+				}
 			}
 		}
 		s -= b.zonePenalty(&o.Zone, cx, cy)
@@ -2727,6 +2760,36 @@ func (b *Brain) laserCover(o *Obs, threats []*Track, mx, my *float64) bool {
 	return true
 }
 
+// canFire (coverreload) reports whether any held weapon can fire within 0.3 s: the gun with ammo and no reload
+// left beyond 0.3 s, a laser not cooling beyond 0.3 s, a mortar off cooldown, or lightning with energy for 3 shots
+// and the target (if any) within its range + 6 m.
+func (b *Brain) canFire(me *Self, gun, laser, light *WeaponState, target *Track) bool {
+	if gun != nil && gun.Ammo > 0 && gun.Reload <= 0.3 {
+		return true
+	}
+	if laser != nil && laser.Cooldown <= 0.3 {
+		return true
+	}
+	if _, mortar := hasWeapon(me.Weapons, "mortar"); mortar != nil && mortar.Cooldown <= 0.3 {
+		return true
+	}
+	if light != nil && me.Energy >= light.Stats.Energy*3 && (target == nil || target.Dist <= light.Stats.Range+6) {
+		return true
+	}
+	return false
+}
+
+// losNow (coverreload) returns the tracks seen this tick that have a clear line to us.
+func losNow(seen []*Track, now float64) []*Track {
+	var out []*Track
+	for _, t := range seen {
+		if t.Seen == now && t.LOS {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 func (b *Brain) reach(me *Self) float64 {
 	r := 0.0
 	for _, w := range me.Weapons {
@@ -3206,6 +3269,10 @@ func applyFlags(p *Params, spec string) {
 			p.ChargeEngage = f
 		case "laserlos":
 			p.LaserLOS = f
+		case "rearavoid":
+			p.RearAvoid = f
+		case "coverreload":
+			p.CoverReload = on
 		case "ffadrops":
 			p.FFADrops = f
 		case "cubestop":
@@ -3324,6 +3391,7 @@ func (b *Brain) safeFallback() {
 		p.LateR, p.HoldOut = 70, 0
 		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
+		p.RearAvoid, p.CoverReload = 0, false
 		p.FFADrops, p.CubeStop, p.EarlyRetreat = 0, false, 0
 		p.LaserLOS = 0
 		p.LCDPunish = 0
