@@ -346,6 +346,13 @@ type Params struct {
 	// a cube), except a cube or crate within 40 m when the next upgrade threshold (cubes.upgrade_thresholds) is
 	// at most 2 cubes away. Cubes we walk over are still picked up.
 	CubeStop bool
+	// EarlyRetreat [earlyretreat]: FFA-only (ffaOn), only before match time EarlyRetreat s (suggested 60; 0 = off).
+	// When a mech that hit us in the last 1.5 s is winning the trade (its HP > 1.15x ours and its HP fraction >
+	// ours + 0.12, with us below 80% HP), or we hold only the gun and it holds a laser or lightning, withdraw to
+	// cover for 5.5 s through the flee latch duelflee uses (oddsFleeUntil -> swamped -> retreat -> coverMove),
+	// unless we are finishing a target. Evidence (Data/Team profiles.md): mechs that leave early fights die far
+	// less before 60 s; we won 6 of 26 decisive fights in which we were opened on.
+	EarlyRetreat float64
 }
 
 func DefaultParams() Params {
@@ -948,6 +955,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 	// duelflee: FFA-only (!pracOn); same flee latch as OddsFlee.
 	if b.P.DuelFlee > 0 && ffaOn && target != nil && !finishing && b.duelOdds(me, target) < b.P.DuelFlee {
 		b.oddsFleeUntil = now + 5
+	}
+	// earlyretreat: FFA-only, early game; same flee latch.
+	if b.P.EarlyRetreat > 0 && ffaOn && now < b.P.EarlyRetreat && !finishing && b.earlyLosing(me, hpFrac, light == nil && laser == nil) {
+		b.oddsFleeUntil = now + 5.5
 	}
 	if now < b.oddsFleeUntil && !finishing {
 		swamped = true
@@ -2232,6 +2243,25 @@ func (b *Brain) dropsOK(o *Obs, d *Drop) bool {
 	return true
 }
 
+// earlyLosing (earlyretreat) reports whether a mech that hit us in the last 1.5 s is winning the trade: it has
+// more than 1.15x our HP and an HP fraction above ours + 0.12 while we are below 80%, or we are gun-only and it
+// holds a laser or lightning.
+func (b *Brain) earlyLosing(me *Self, hpFrac float64, gunOnly bool) bool {
+	for _, t := range b.tracks {
+		if t.Kind != "mech" || b.now-t.HitMe >= 1.5 {
+			continue
+		}
+		if gunOnly && (holds(t.Weapons, "laser") || holds(t.Weapons, "lightning")) {
+			return true
+		}
+		tf := t.HP / math.Max(1, t.MaxHP)
+		if hpFrac < 0.8 && t.HP > 1.15*me.HP && tf > hpFrac+0.12 {
+			return true
+		}
+	}
+	return false
+}
+
 // cubeSkip (cubestop) says whether to skip a detour to the cube or crate at pos: only when CubeStop is on, the
 // match is a proven FFA (ffaOn) and we hold at least cubes.stat_cap cubes, unless the next upgrade threshold is at
 // most 2 cubes away and pos is within 40 m.
@@ -2708,7 +2738,7 @@ func squadParams(p Params) Params {
 	p.TPJoin, p.BackOpen, p.PreCharge, p.PeekCD = 0, 0, 0, 0
 	p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 	p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
-	p.FFADrops, p.CubeStop = false, false
+	p.FFADrops, p.CubeStop, p.EarlyRetreat = false, false, 0
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2958,6 +2988,8 @@ func applyFlags(p *Params, spec string) {
 			p.CubeStop = on
 		case "dropalive":
 			p.DropAlive = int(f)
+		case "earlyretreat":
+			p.EarlyRetreat = f
 		}
 	}
 }
@@ -3066,7 +3098,7 @@ func (b *Brain) safeFallback() {
 		p.LateR, p.HoldOut = 70, 0
 		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
-		p.FFADrops, p.CubeStop = false, false
+		p.FFADrops, p.CubeStop, p.EarlyRetreat = false, false, 0
 	}
 	off(&b.base)
 	b.regenOn = false
