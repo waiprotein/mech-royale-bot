@@ -400,6 +400,14 @@ type Params struct {
 	// Candidate fight positions closer than that to any other seen lightning holder are penalised. 0 = off
 	// (suggested 12).
 	LightPad float64
+	// SmartFire [smartfire]: PRACTICE-side (only while !ffaOn). Fire control from the exact damage rules in
+	// hello.config: laser damage = damage x (min_frac + (1 - min_frac) x charge / full charge) x cube multiplier
+	// x cook-off (+60% vs a mortar holder) x rear_mult (1.5) when we are in the target's rear arc. Early laser
+	// release when that damage x SmartFire >= the target's HP (giddy's Lethal: squad mode only, factor 0.7, rear
+	// only with Backstab); and "finishing" (commit: no retreat or flee, close to Finish range) also when a ready
+	// laser at full charge, or a short gun burst (<= 1 s, in ammo, within 60 m), kills it at that safety factor.
+	// The value is the safety factor (suggested 0.92: one unseen armour stack); 0 = off.
+	SmartFire float64
 }
 
 func DefaultParams() Params {
@@ -1027,6 +1035,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 			}
 		}
 	}
+	if b.P.SmartFire > 0 && !ffaOn && target != nil && !finishing && b.canKill(me, target, gun, laser, x, y) {
+		finishing = true // smartfire: commit when our burst kills it
+	}
 	_, myLaser := hasWeapon(me.Weapons, "laser")
 	outgunned := target != nil && holds(target.Weapons, "laser") && myLaser == nil && target.Dist > 55 && hpFrac < 0.8
 	if b.P.GunOnlyOut && ffaOn && gun != nil && light == nil && laser == nil {
@@ -1478,18 +1489,24 @@ func (b *Brain) step(o *Obs, act *Action) {
 					break
 				}
 				full := w.Stats.Charge
-				if b.P.Lethal && w.Charge >= w.Stats.MinCharge && w.Charge < full-0.051 {
-					dmg := w.Stats.Damage * (w.Stats.MinFrac + (1-w.Stats.MinFrac)*w.Charge/full) *
-						(1 + b.Cfg.Cubes.DamagePerCube*float64(min(me.Cubes, b.Cfg.Cubes.StatCap)))
-					if holds(target.Weapons, "mortar") {
-						dmg *= 1 + w.Stats.Cookoff
-					}
-					lk := 0.8
-					if b.P.LethalK > 0 {
-						lk = b.P.LethalK
-					}
-					if b.P.Backstab > 0 && b.showsBack(target, x, y) {
-						dmg *= b.rearMult()
+				smart := b.P.SmartFire > 0 && !b.ffaNow
+				if (b.P.Lethal || smart) && w.Charge >= w.Stats.MinCharge && w.Charge < full-0.051 {
+					var dmg, lk float64
+					if smart {
+						dmg, lk = b.laserDmg(me, w, target, w.Charge, x, y), b.P.SmartFire // smartfire: exact damage
+					} else {
+						dmg = w.Stats.Damage * (w.Stats.MinFrac + (1-w.Stats.MinFrac)*w.Charge/full) *
+							(1 + b.Cfg.Cubes.DamagePerCube*float64(min(me.Cubes, b.Cfg.Cubes.StatCap)))
+						if holds(target.Weapons, "mortar") {
+							dmg *= 1 + w.Stats.Cookoff
+						}
+						lk = 0.8
+						if b.P.LethalK > 0 {
+							lk = b.P.LethalK
+						}
+						if b.P.Backstab > 0 && b.showsBack(target, x, y) {
+							dmg *= b.rearMult()
+						}
 					}
 					if dmg*lk >= target.HP && math.Abs(angDiff(hy, me.Aim[0])) < tolY*0.9 && math.Abs(hp-me.Aim[1]) < tolP {
 						aim = [2]float64{hy, hp}
@@ -2457,6 +2474,44 @@ func (b *Brain) lcdWindow(t *Track) bool {
 	return b.now-t.LaserAt < w
 }
 
+// dmgMult (smartfire) is our damage multiplier from cubes (capped at cubes.stat_cap) and, when we stand in t's
+// rear arc (showsBack, with its 0.1 rad margin), mech.rear_mult.
+func (b *Brain) dmgMult(me *Self, t *Track, x, y float64) float64 {
+	m := 1 + b.Cfg.Cubes.DamagePerCube*float64(min(me.Cubes, b.Cfg.Cubes.StatCap))
+	if b.showsBack(t, x, y) {
+		m *= b.rearMult()
+	}
+	return m
+}
+
+// laserDmg (smartfire) is the damage our laser w deals t if released at the given charge (seconds).
+func (b *Brain) laserDmg(me *Self, w *WeaponState, t *Track, charge, x, y float64) float64 {
+	full := math.Max(w.Stats.Charge, 1e-6)
+	d := w.Stats.Damage * (w.Stats.MinFrac + (1-w.Stats.MinFrac)*math.Min(charge, full)/full) * b.dmgMult(me, t, x, y)
+	if holds(t.Weapons, "mortar") {
+		d *= 1 + w.Stats.Cookoff
+	}
+	return d
+}
+
+// canKill (smartfire) reports whether our next burst kills t at the SmartFire safety factor: a ready laser
+// (cooldown <= 0.1 s, in range) at full charge, or a gun burst of at most 1 s within our ammo at <= 60 m.
+func (b *Brain) canKill(me *Self, t *Track, gun, laser *WeaponState, x, y float64) bool {
+	k := b.P.SmartFire
+	if laser != nil && laser.Cooldown <= 0.1 && t.Dist <= laser.Stats.Range*0.97 &&
+		b.laserDmg(me, laser, t, laser.Stats.Charge, x, y)*k >= t.HP {
+		return true
+	}
+	if gun != nil && gun.Reload <= 0 && t.Dist <= math.Min(60, gun.Stats.Range*0.96) && gun.Stats.Damage > 0 {
+		per := gun.Stats.Damage * b.dmgMult(me, t, x, y) * k
+		n := math.Ceil(t.HP / per)
+		if n <= float64(gun.Ammo) && n*gun.Stats.Cooldown <= 1.0 {
+			return true
+		}
+	}
+	return false
+}
+
 // lightReach (lightpad) is the distance we keep from lightning holders: weapons.lightning.range (45 m if
 // missing) plus LightPad.
 func (b *Brain) lightReach() float64 {
@@ -3320,6 +3375,8 @@ func applyFlags(p *Params, spec string) {
 			p.LCDPunish = f
 		case "lightpad":
 			p.LightPad = f
+		case "smartfire":
+			p.SmartFire = f
 		}
 	}
 }
@@ -3431,7 +3488,7 @@ func (b *Brain) safeFallback() {
 		p.RearAvoid, p.CoverReload = 0, false
 		p.FFADrops, p.CubeStop, p.EarlyRetreat = 0, false, 0
 		p.LaserLOS = 0
-		p.LCDPunish, p.LightPad = 0, 0
+		p.LCDPunish, p.LightPad, p.SmartFire = 0, 0, 0
 	}
 	off(&b.base)
 	b.regenOn = false
