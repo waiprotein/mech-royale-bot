@@ -374,6 +374,19 @@ func DefaultParams() Params {
 	// at the final centre is skipped until the zone forces the bot in.
 	p.PracAt = 20
 	p.FFAStrict = true
+	// C1 (provisional, Sun 01:40 UTC): our FFA brain, active only after a proven free-for-all (2 deaths we did not
+	// cause), so practice play stays identical to giddy's base. Integrated stack C0-full minus duelflee and
+	// chargeengage (both negative in their screens): mixed field +0.48 +- 0.13, giddy field +0.13 +- 0.19 (partial).
+	p.FFAStrictN = 2
+	p.GunOnlyOut = true
+	p.GunOnlyR = 130
+	p.LRLaser = 180
+	p.LRKeep = 110
+	p.LRHP = 1.0
+	p.LightLOS = true
+	p.RegenHide = 0.6
+	p.HomeLOS = 60
+	p.WatchLast = 8
 	p.BeamFFA = false // practice-safe (S5 = 6.19) but -0.28 in the FFA sim (round 9); kept as a flag
 	p.LateR = 25
 	p.HoldOut = 368
