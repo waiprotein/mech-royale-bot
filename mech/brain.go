@@ -560,6 +560,12 @@ type Params struct {
 	// 0.8). Apex-Go's practice stance retreats at 20% and returns at 65%: back in the fight sooner, more kills.
 	// 0 = use RecoverHP.
 	SqRetUp float64
+	// PEngage [pengage]: PRACTICE / PRE-LATCH engage radius (m). While giddy's FFA latch has not fired (b.notPractice
+	// false: all of practice, including the ghost windows before PracAt and after CautiousT, and an FFA only before
+	// its first death we did not cause), EngageDist = PEngage instead of 60; after the latch the base value applies,
+	// so post-latch FFA play is unchanged. The practice sim found global engage=80 at about +0.2 vs x5, mostly from
+	// the non-squad windows. 0 = off.
+	PEngage float64
 	// SqCorner [sqcorner]: with SqRet on, after more than 2 s of squad-mode retreat, if exactly one mech seen this
 	// tick has line of sight to us within 45 m (a lone chaser) and our odds against it are above 0.35, stop
 	// retreating for this tick and fight it (running from a lone close chaser just gives it free hits). false = off.
@@ -881,6 +887,17 @@ func (b *Brain) observe(o *Obs) {
 			b.P.LaserFirst, b.P.LaserSeek, b.P.LootRadius = true, 240, 150
 		} else if b.pracOn {
 			b.P = squadParams(b.base)
+		}
+	}
+
+	// pengage: practice / pre-latch engage radius. While giddy's FFA latch has not fired (all of practice, and an
+	// FFA only until its first death we did not cause), EngageDist = PEngage; after the latch it is the base value,
+	// so post-latch FFA play is unchanged. sqengage keeps priority in squad mode.
+	if b.base.PEngage > 0 && !(b.pracOn && b.base.SqEngage > 0) {
+		if !b.notPractice {
+			b.P.EngageDist = b.base.PEngage
+		} else {
+			b.P.EngageDist = b.base.EngageDist
 		}
 	}
 
@@ -4394,6 +4411,8 @@ func applyFlags(p *Params, spec string) {
 			p.SqRet = f
 		case "sqretup":
 			p.SqRetUp = f
+		case "pengage":
+			p.PEngage = f
 		case "sqcorner":
 			p.SqCorner = on
 		case "kiteboost":
@@ -4522,6 +4541,7 @@ func (b *Brain) safeFallback() {
 		p.Arm, p.Scan, p.CubePush, p.ArmFirst = false, 0, 0, false
 		p.SqRim, p.SqLootIn, p.SqBand, p.SqRet = 0, 0, false, 0
 		p.SqRetUp, p.SqCorner = 0, false
+		p.PEngage = 0
 		p.SqSpeed, p.SqDodge, p.SqEngage = false, 0, 0
 		p.SqHunt = 0
 		p.RegenLock, p.RegenLockHP = false, 0
