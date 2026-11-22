@@ -143,6 +143,8 @@ type Brain struct {
 	ccFailAt                float64
 	// kitew: fightMove adds KiteW per metre of distance gained from the target while this is set (fight branch only).
 	kiteOn bool
+	// regenlock: per mech id, the damage we landed since its regen window last (re)started and our last hit on it.
+	rlWin map[int]*regenWin
 	// regenhide: latched while regenerating in cover, and when the latch started.
 	regenOn bool
 	regenAt float64
@@ -582,6 +584,17 @@ type Params struct {
 	// kept); with no target in LOS, walk to the nearest such hidden mech; with only the gun (no laser/lightning),
 	// fight it from 18-42 m (preferred range = its distance clamped to that band). 0 = off.
 	SqHunt float64
+	// RegenLock [regenlock]: PRACTICE-side, squad mode only (pracOn). Practice points are house bots we kill, and
+	// damage that does not finish a kill comes back (regen_per_s after regen_delay s without dealing or taking
+	// damage). While a mech we hit is inside that window (now - our last hit on it < mech.regen_delay):
+	//   - it stays engaged, and its target score drops by 0.2 per HP we landed on it in the window (max 200), plus
+	//     40, so we stay on it instead of switching to a fresher one;
+	//   - if no visible target is chosen and it is out of sight or out of our target range, we walk (pathfind) to
+	//     its last seen position for the rest of the window, if we can get within our weapon reach of that spot
+	//     before the window ends, our HP is >= RegenLockHP of max, and no other mech is seen within 60 m.
+	// Off by default. RegenLockHP [regenlockhp]: chase HP floor (0 = 0.4).
+	RegenLock   bool
+	RegenLockHP float64
 	// KiteBoost [kiteboost]: PRACTICE-side (only while !ffaOn). The house squad walks in to its own short range, where
 	// it hits us far more (sim traces: a visible house bot deals ~56 HP/s at 30-50 m, ~17 at 70-90 m, ~8 at
 	// 110-140 m) while our own damage holds up with range (laser exchange ratio ~2 at 30-50 m, 7-9 at 110-180 m).
@@ -1028,6 +1041,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 	if b.P.LCDPunish > 0 {
 		b.noteLaserShots(o) // lcdpunish: who just fired a laser (state only)
 	}
+	if b.P.RegenLock {
+		b.noteRegenHits(o) // regenlock: damage we landed per mech inside its regen window (state only)
+	}
 	st := &me.Stats
 	x, y, zf := me.Pos[0], me.Pos[1], me.Pos[2]
 	z := &o.Zone
@@ -1065,6 +1081,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 	}
 	// hunthide: only while squad params are on (pracOn, so !Ghost), and only with 2+ calm mechs (see HuntHide).
 	huntHide := false
+	rlOn := b.P.RegenLock && b.pracOn // regenlock: squad mode only
 	if b.P.HuntHide && b.pracOn && !b.P.Ghost {
 		calm := 0
 		for _, t := range b.tracks {
@@ -1198,6 +1215,12 @@ func (b *Brain) step(o *Obs, act *Action) {
 			(t.HP < 350 && t.Dist < 120) || o.Alive <= 2) {
 			t.Engage = false // squad engagement that giddy's FFA ghost rule would not take
 		}
+		rlDmg := -1.0 // regenlock: damage we landed on it inside its live regen window (-1 = none)
+		if rlOn {
+			if w := b.regenLive(t.ID); w != nil {
+				t.Engage, rlDmg = true, w.dmg
+			}
+		}
 		if t.Engage && !t.LOS && t.Dist < maxT && (hidden == nil || t.Dist < hidden.Dist) {
 			hidden = t
 		}
@@ -1232,6 +1255,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		if b.P.SqBackOpen && b.pracOn && offAim > 1.0 {
 			s -= 60 // sqbackopen: its back is turned
 		}
+		if rlDmg >= 0 {
+			s -= 40 + math.Min(200, 0.2*rlDmg) // regenlock: stay on it until its regen window runs out
+		}
 		if s < bestScore {
 			bestScore, target = s, t
 		}
@@ -1248,6 +1274,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 	}
 	if foe == nil && b.P.Pursue > 0 && hidden != nil && hidden.HP < b.P.Pursue*hidden.MaxHP {
 		foe = hidden
+	}
+	var rlChase *Track // regenlock: hurt mech out of sight (or range) to walk after inside its regen window
+	if rlOn && target == nil && foe == nil {
+		rlChase = b.regenChase(me, hpFrac)
 	}
 	danger := false
 	crowd := 0
@@ -1493,6 +1523,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 	case len(sqAvoid) > 0 && target == nil && !finishing && b.coverMove(o, sqAvoid, &mx, &my):
 		boost = me.Energy > 20 && (mx != 0 || my != 0)
 		mode = "sqavoid" // sqbackopen: break the LOS of a facing mech we are too weak to open on
+	case rlChase != nil:
+		// regenlock: walk to where the hurt mech was last seen while its regen window is still open.
+		mx, my = b.travel(me, rlChase.Pos[0], rlChase.Pos[1])
+		mode = "regenchase"
 	case foe != nil:
 
 		ready := gun != nil && gun.Ammo > 0 && gun.Reload <= 0.25 && foe.Dist <= gun.Stats.Range-10
@@ -1944,6 +1978,8 @@ func (b *Brain) step(o *Obs, act *Action) {
 		switch {
 		case watch != nil:
 			aim[0] = math.Atan2(watch.Pos[1]-y, watch.Pos[0]-x)
+		case rlChase != nil:
+			aim[0] = math.Atan2(rlChase.Pos[1]-y, rlChase.Pos[0]-x) // regenlock: face where it was
 		case rearT != nil:
 			aim[0] = math.Atan2(rearT.Pos[1]-y, rearT.Pos[0]-x)
 		case b.npcHurt > 0 && now-b.npcHurt < 2.5:
@@ -3056,6 +3092,84 @@ func (b *Brain) squadRimSpot(z *Zone, x, y float64) (float64, float64) {
 	return cx + math.Cos(th)*r, cy + math.Sin(th)*r
 }
 
+// regenWin (regenlock) is one mech's regen window as far as our hits show it: when the window (re)started, our
+// last hit on it and the damage we landed since the start.
+type regenWin struct {
+	start, last, dmg float64
+}
+
+// regenDelay (regenlock) is mech.regen_delay from hello.config (5 s if missing).
+func (b *Brain) regenDelay() float64 {
+	return dflt(b.Cfg.Mech.RegenDelay, 5)
+}
+
+// noteRegenHits (regenlock) folds this tick's hit events on mechs into the per-mech regen windows. A hit after the
+// window has lapsed (regen_delay since our last hit) starts a new window.
+func (b *Brain) noteRegenHits(o *Obs) {
+	if b.rlWin == nil {
+		b.rlWin = map[int]*regenWin{}
+	}
+	for i := range o.Events {
+		e := &o.Events[i]
+		if e.Type != "hit" || e.Amount <= 0 || b.tracks[e.Target] == nil {
+			continue
+		}
+		w := b.rlWin[e.Target]
+		if w == nil || o.T-w.last >= b.regenDelay() {
+			w = &regenWin{start: o.T}
+			b.rlWin[e.Target] = w
+		}
+		w.last, w.dmg = o.T, w.dmg+e.Amount
+	}
+	for id, w := range b.rlWin {
+		if o.T-w.last >= b.regenDelay() || b.tracks[id] == nil {
+			delete(b.rlWin, id)
+		}
+	}
+}
+
+// regenLive (regenlock) returns mech id's regen window if our last hit on it is less than regen_delay ago.
+func (b *Brain) regenLive(id int) *regenWin {
+	if w := b.rlWin[id]; w != nil && b.now-w.last < b.regenDelay() {
+		return w
+	}
+	return nil
+}
+
+// regenChase (regenlock) picks the mech to walk after: a live regen window, last seen out of sight or out of our
+// target range, reachable to within our weapon reach before the window ends, with our HP >= RegenLockHP (0.4) of
+// max and no other mech seen in the last 2.5 s within 60 m. The most recently hit one wins (ties: lower id).
+func (b *Brain) regenChase(me *Self, hpFrac float64) *Track {
+	if hpFrac < dflt(b.P.RegenLockHP, 0.4) {
+		return nil
+	}
+	var best *Track
+	bestLast := math.Inf(-1)
+	for id, w := range b.rlWin {
+		t := b.tracks[id]
+		if t == nil || b.regenLive(id) == nil {
+			continue
+		}
+		left := b.regenDelay() - (b.now - w.last)
+		d := hyp(t.Pos[0]-me.Pos[0], t.Pos[1]-me.Pos[1])
+		if math.Max(0, d-b.reach(me))/math.Max(1, me.Stats.WalkSpeed) >= left {
+			continue
+		}
+		if w.last > bestLast || (w.last == bestLast && best != nil && id < best.ID) {
+			best, bestLast = t, w.last
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	for _, t := range b.tracks {
+		if t != best && b.now-t.Seen < 2.5 && hyp(t.Pos[0]-me.Pos[0], t.Pos[1]-me.Pos[1]) < 60 {
+			return nil
+		}
+	}
+	return best
+}
+
 // lightReach (lightpad) is the distance we keep from lightning holders: weapons.lightning.range (45 m if
 // missing) plus LightPad.
 // threatTau is threatfocus's decay time constant (s).
@@ -4122,6 +4236,10 @@ func applyFlags(p *Params, spec string) {
 			p.SqHunt = f
 		case "sqengage":
 			p.SqEngage = f
+		case "regenlock":
+			p.RegenLock = on
+		case "regenlockhp":
+			p.RegenLockHP = f
 		case "threatboost":
 			p.ThreatBoost = f
 		case "opening":
@@ -4406,6 +4524,7 @@ func (b *Brain) safeFallback() {
 		p.SqRetUp, p.SqCorner = 0, false
 		p.SqSpeed, p.SqDodge, p.SqEngage = false, 0, 0
 		p.SqHunt = 0
+		p.RegenLock, p.RegenLockHP = false, 0
 		p.ArmBoost, p.SqJink = false, false
 	}
 	off(&b.base)
