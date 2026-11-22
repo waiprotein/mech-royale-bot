@@ -561,6 +561,11 @@ type Params struct {
 	// (sd 0.12). Off by default (suggested sqspeed=1, sqdodge=25).
 	SqSpeed bool
 	SqDodge float64
+	// SqEngage [sqengage]: PRACTICE-side, squad mode only (squadParams, i.e. while pracOn). EngageDist override:
+	// healthy, calm mechs inside this many metres are engaged (giddy: 60). Unlike the global engage flag it leaves
+	// ghost play (before PracAt, after CautiousT) and FFA play unchanged. 0 = off (suggested 80, from the practice
+	// sweep's engage=80).
+	SqEngage float64
 	// KiteBoost [kiteboost]: PRACTICE-side (only while !ffaOn). The house squad walks in to its own short range, where
 	// it hits us far more (sim traces: a visible house bot deals ~56 HP/s at 30-50 m, ~17 at 70-90 m, ~8 at
 	// 110-140 m) while our own damage holds up with range (laser exchange ratio ~2 at 30-50 m, 7-9 at 110-180 m).
@@ -3830,6 +3835,9 @@ func squadParams(p Params) Params {
 	if p.SqHPw > 0 {
 		p.HPw = p.SqHPw
 	}
+	if p.SqEngage > 0 {
+		p.EngageDist = p.SqEngage // sqengage: squad-mode engage radius only
+	}
 	if p.SqUseDrops {
 		p.UseDrops = true
 	}
@@ -4038,6 +4046,8 @@ func applyFlags(p *Params, spec string) {
 			p.SqSpeed = on
 		case "sqdodge":
 			p.SqDodge = f
+		case "sqengage":
+			p.SqEngage = f
 		case "threatboost":
 			p.ThreatBoost = f
 		case "opening":
@@ -4315,7 +4325,7 @@ func (b *Brain) safeFallback() {
 		p.CautiousT, p.PracRim = 0, 0
 		p.Arm, p.Scan, p.CubePush, p.ArmFirst = false, 0, 0, false
 		p.SqRim, p.SqLootIn, p.SqBand, p.SqRet = 0, 0, false, 0
-		p.SqSpeed, p.SqDodge = false, 0
+		p.SqSpeed, p.SqDodge, p.SqEngage = false, 0, 0
 		p.ArmBoost, p.SqJink = false, false
 	}
 	off(&b.base)
