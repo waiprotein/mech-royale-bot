@@ -141,6 +141,9 @@ type Brain struct {
 	losEyes []Vec3
 	losTick int
 	homeVis bool
+	// sqret: squad-mode HP retreat latch. finMove (sqband): set while fightMove runs for the finish rule.
+	sqRetOn bool
+	finMove bool
 }
 
 type Params struct {
@@ -495,6 +498,28 @@ type Params struct {
 	// middle, the rim keeps one side open and the zone at our back predictable. 0 = off (suggested 0.88; idea from
 	// Apex-Go PracticeRim, 88% rim while r >= 180, +0.16 in its practice stack, and 4141's 0.9 rim play).
 	PracRim float64
+	// SquadRim family [squadrim=1 turns on all four parts at their suggested values]: PRACTICE-side, acts ONLY
+	// while squad params are on (pracOn), so base/ghost play and play after the FFA latch are unchanged. Our own
+	// code from the 4141 behaviour spec (vault Data/Rival code survey.md, squad phase).
+	//
+	// SqRim [sqrim]: idle squad play (no fight, loot or urgent zone move) holds a spot SqRim x the next circle's
+	// radius from its centre while that radius is >= 200 m (0.6 x below 200 m, 0.35 x below 50 m; always >= 8 m
+	// inside the circle), drifting along the rim away from the mechs seen in the last 20 s (push <= 0.5 rad).
+	// It replaces giddy's idle zone walk and stand-still (and pracrim) while on. 0 = off (squadrim: 0.9).
+	SqRim float64
+	// SqLootIn [sqloot]: loot lying inside 0.81 x the next circle's radius from its centre is considered only
+	// within SqLootIn m of us (laser and lightning pickups exempt), so loot runs do not pull us into the middle
+	// where the house squad roams. 0 = off (squadrim: 50).
+	SqLootIn float64
+	// SqBand [sqband]: against mechs, fightMove scores our range as a band (no penalty inside it) instead of one
+	// distance: gun 85-125 m (house guns miss past ~80 m), laser 110-175 m, each capped 15 m inside the weapon's
+	// config range. Inactive while finishing, with lightning, or when another rule moved the range (lcdpunish,
+	// lightpad, lightning/mortar holders). Off by default (squadrim: on).
+	SqBand bool
+	// SqRet [sqret]: squad-mode HP retreat. giddy's RetreatHP (0.38) never acts under squad params: LoseRule
+	// overwrites the retreat flag every tick. SqRet adds a latch on top of LoseRule: below SqRet with a threat
+	// in the last 2 s we retreat until RecoverHP (0.8), or 7 s with no threat above 55%. 0 = off (squadrim: 0.30).
+	SqRet float64
 }
 
 func DefaultParams() Params {
@@ -1217,6 +1242,23 @@ func (b *Brain) step(o *Obs, act *Action) {
 		}
 		b.retreat = now-b.loseAt < 1.5 && b.loseAt > 0
 	}
+	// sqret: squad-mode HP retreat latch on top of LoseRule (see SqRet).
+	if b.P.SqRet > 0 && b.pracOn {
+		if !b.sqRetOn && hpFrac < b.P.SqRet && now-b.lastThreatAt < 2 {
+			b.sqRetOn = true
+			if !b.retreat {
+				b.coverAt = -1
+			}
+		}
+		if b.sqRetOn && (hpFrac > b.P.RecoverHP || (now-b.lastThreatAt > 7 && hpFrac > 0.55)) {
+			b.sqRetOn = false
+		}
+		if b.sqRetOn {
+			b.retreat = true
+		}
+	} else {
+		b.sqRetOn = false
+	}
 	// regenhide: FFA-only. Latch below RegenHide with no target/foe; release at 90% HP, after 30 s, when late or
 	// when FFA play stops (see RegenHide).
 	sqRegen := b.P.SqLRLaser > 0 && b.pracOn // sqlrlaser: regenhide-style latch in squad mode below 50% HP
@@ -1367,7 +1409,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		}
 		if keep := b.P; b.P.Finish > 0 && foe.HP < finHP*foe.MaxHP && hpFrac > 0.42 && crowd <= 2 {
 			b.P.GunRange, b.P.LaserRange, b.P.LightRange = b.P.Finish, b.P.Finish, b.P.Finish
+			b.finMove = true // sqband: no range band while closing in to finish
 			mx, my = b.fightMove(o, foe, seen, wantLos)
+			b.finMove = false
 			b.P = keep
 			if b.P.FinishRush && foe.Dist > 2*b.P.Finish && me.Energy > 30 {
 				boost = true
@@ -1439,6 +1483,13 @@ func (b *Brain) step(o *Obs, act *Action) {
 				if lc.kind == "drop" && hyp(lc.pos[0]-x, lc.pos[1]-y) < 2.5 {
 					mx, my = 0, 0
 				}
+			}
+		} else if b.P.SqRim > 0 && b.pracOn && z.NextRadius > 0 {
+			// sqrim: idle squad play holds (and drifts along) the rim of the next circle; it replaces the idle
+			// zone walk, since the rim spot is always inside the next circle.
+			if rx, ry := b.squadRimSpot(z, x, y); hyp(rx-x, ry-y) > 6 {
+				mx, my = b.travel(me, rx, ry)
+				mode = "sqrim"
 			}
 		} else if zdist > 3 && (!b.P.Ghost || (z.NextRadius <= 30 && !b.holdingOut(z, o.Alive))) {
 			mx, my = b.travel(me, zgx, zgy)
@@ -2080,10 +2131,45 @@ func (b *Brain) prefRange(me *Self, t *Track) float64 {
 	return r
 }
 
+// squadBand (sqband) is the stand-off band [lo, hi] against a mech under squad params: gun 85-125 m, laser
+// 110-175 m, each capped 15 m inside the weapon's config range. It returns (rp, rp), i.e. giddy's single range,
+// for NPCs, with lightning in use, or when prefRange moved the range away from the plain weapon range.
+func (b *Brain) squadBand(me *Self, t *Track, rp float64) (float64, float64) {
+	if t.Kind == "npc" {
+		return rp, rp
+	}
+	_, light := hasWeapon(me.Weapons, "lightning")
+	_, laser := hasWeapon(me.Weapons, "laser")
+	var w *WeaponState
+	lo, hi, base := 85.0, 125.0, b.P.GunRange
+	switch {
+	case light != nil && me.Energy > 12:
+		return rp, rp
+	case laser != nil:
+		w, lo, hi, base = laser, 110, 175, b.P.LaserRange
+	default:
+		_, w = hasWeapon(me.Weapons, "gun")
+	}
+	if rp != base {
+		return rp, rp
+	}
+	if w != nil && w.Stats.Range > 0 {
+		hi = math.Min(hi, w.Stats.Range-15)
+	}
+	if hi <= lo {
+		return rp, rp
+	}
+	return lo, hi
+}
+
 func (b *Brain) fightMove(o *Obs, tg *Track, seen []*Track, wantLos float64) (float64, float64) {
 	me := &o.Self
 	x, y := me.Pos[0], me.Pos[1]
 	rp := b.prefRange(me, tg)
+	lo, hi := rp, rp
+	if b.P.SqBand && b.pracOn && !b.finMove {
+		lo, hi = b.squadBand(me, tg, rp)
+	}
 	bx, by := tg.Pos[0]-x, tg.Pos[1]-y
 	bd := hyp(bx, by) + 1e-9
 	ux, uy := bx/bd, by/bd
@@ -2125,7 +2211,11 @@ func (b *Brain) fightMove(o *Obs, tg *Track, seen []*Track, wantLos float64) (fl
 		}
 		cz := b.W.WalkAt(cx, cy)
 		d := hyp(tg.Pos[0]-cx, tg.Pos[1]-cy)
-		s := -1.1*math.Abs(d-rp) - r*0.4
+		dev := math.Abs(d - rp)
+		if hi > lo { // sqband: no range penalty inside [lo, hi]
+			dev = math.Max(0, math.Max(lo-d, d-hi))
+		}
+		s := -1.1*dev - r*0.4
 		los := b.W.Clear(Vec3{cx, cy, cz + mh}, tc)
 		if los {
 			s += 45 * wantLos
@@ -2334,6 +2424,10 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 			soleWeapon = -1
 		}
 	}
+	lootIn := 0.0 // sqloot: loot deep inside the next circle only this close (0 = no limit)
+	if b.P.SqLootIn > 0 && b.pracOn && z.NextRadius > 0 {
+		lootIn = b.P.SqLootIn
+	}
 	consider := func(kind string, id int, pos Vec3, value float64) {
 		if until, ok := b.bad[id]; ok && until > now {
 			return
@@ -2341,6 +2435,11 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 		d := hyp(pos[0]-x, pos[1]-y)
 		if d > 260 {
 			return
+		}
+		if lootIn > 0 && d > lootIn && hyp(pos[0]-z.NextCenter[0], pos[1]-z.NextCenter[1]) < 0.81*z.NextRadius {
+			if p := b.pickups[id]; kind != "pickup" || p == nil || (p.Kind != "laser" && p.Kind != "lightning") {
+				return
+			}
 		}
 		if hyp(pos[0]-cur.X, pos[1]-cur.Y) > cur.R-6 {
 			return
@@ -2736,6 +2835,42 @@ func (b *Brain) rimSpot(z *Zone, x, y float64) (float64, float64) {
 	}
 	r := b.P.PracRim * z.NextRadius
 	return z.NextCenter[0] + dx/d*r, z.NextCenter[1] + dy/d*r
+}
+
+// squadRimSpot (sqrim) is where idle squad play waits: SqRim x the next circle's radius from its centre while the
+// radius is >= 200 m (0.6 x below 200 m, 0.35 x below 50 m), at least 8 m inside the circle, on our side of the
+// centre (east if we stand on it), turned along the rim away from the mechs seen in the last 20 s. Each such mech
+// pushes us by up to 0.5 rad, more when it is close to our bearing and far from the centre; the total push is
+// clamped to +-0.5 rad, so we drift while mechs are about and hold still once they are gone.
+func (b *Brain) squadRimSpot(z *Zone, x, y float64) (float64, float64) {
+	cx, cy, R := z.NextCenter[0], z.NextCenter[1], z.NextRadius
+	f := b.P.SqRim
+	switch {
+	case R < 50:
+		f = 0.35
+	case R < 200:
+		f = 0.6
+	}
+	r := math.Max(0, math.Min(f*R, R-8))
+	th := 0.0
+	if hyp(x-cx, y-cy) >= 1 {
+		th = math.Atan2(y-cy, x-cx)
+	}
+	push := 0.0
+	for _, t := range b.recentMechs(x, y, 20) { // sorted, so the sum is reproducible
+		rho := hyp(t.Pos[0]-cx, t.Pos[1]-cy)
+		if rho < 1 || r < 1 {
+			continue
+		}
+		dl := angDiff(th, math.Atan2(t.Pos[1]-cy, t.Pos[0]-cx))
+		w := 0.5 * (1 - math.Abs(dl)/math.Pi) * math.Min(1, rho/r)
+		if dl < 0 {
+			w = -w
+		}
+		push += w
+	}
+	th += clamp(push, -0.5, 0.5)
+	return cx + math.Cos(th)*r, cy + math.Sin(th)*r
 }
 
 // lightReach (lightpad) is the distance we keep from lightning holders: weapons.lightning.range (45 m if
@@ -3845,6 +3980,20 @@ func applyFlags(p *Params, spec string) {
 			p.CautiousT = f
 		case "pracrim":
 			p.PracRim = f
+		case "squadrim":
+			if on {
+				p.SqRim, p.SqLootIn, p.SqBand, p.SqRet = 0.9, 50, true, 0.30
+			} else {
+				p.SqRim, p.SqLootIn, p.SqBand, p.SqRet = 0, 0, false, 0
+			}
+		case "sqrim":
+			p.SqRim = f
+		case "sqloot":
+			p.SqLootIn = f
+		case "sqband":
+			p.SqBand = on
+		case "sqret":
+			p.SqRet = f
 		}
 	}
 }
@@ -3962,9 +4111,11 @@ func (b *Brain) safeFallback() {
 		p.LCDPunish, p.LightPad, p.SmartFire = 0, 0, 0
 		p.CautiousT, p.PracRim = 0, 0
 		p.Arm, p.Scan, p.CubePush, p.ArmFirst = false, 0, 0, false
+		p.SqRim, p.SqLootIn, p.SqBand, p.SqRet = 0, 0, false, 0
 	}
 	off(&b.base)
 	b.regenOn = false
+	b.sqRetOn = false
 	if b.pracOn {
 		b.P = squadParams(b.base)
 	} else {
