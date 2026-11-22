@@ -31,6 +31,8 @@ type Track struct {
 	LOSAt float64
 	// LRAt (lrlaser): last time the long-range laser opener rule held for it.
 	LRAt float64
+	// LaserAt (lcdpunish): last time we saw (beam) or heard (laser sound on its bearing) this mech fire its laser.
+	LaserAt float64
 }
 
 type known struct {
@@ -365,6 +367,13 @@ type Params struct {
 	// unless we are finishing a target. Evidence (Data/Team profiles.md): mechs that leave early fights die far
 	// less before 60 s; we won 6 of 26 decisive fights in which we were opened on.
 	EarlyRetreat float64
+	// LCDPunish [lcdpunish]: PRACTICE-side (acts only while !ffaOn: practice and before the FFA proof). A laser
+	// cannot fire again for its cooldown (weapons.laser.cooldown, 1.65 s) after a shot. For LCDPunish s after we
+	// see a visible laser holder fire (its beam, or a laser sound within 0.35 rad of its bearing), engage it if our
+	// HP >= its HP (in LOS, within reach), prefer it as target and close to <= 50 m. Outside that window, do not
+	// open on a laser holder: a fresh one (no hits either way for 6 s) that is not aiming at us, not below 350 HP
+	// and not in the end game is not engaged. 0 = off (suggested 1.5, a little under the cooldown).
+	LCDPunish float64
 }
 
 func DefaultParams() Params {
@@ -491,7 +500,7 @@ func (b *Brain) observe(o *Obs) {
 		}
 		t := tab[m.ID]
 		if t == nil {
-			t = &Track{HitMe: -100, CalmAt: -100, HurtAt: -100, TPAt: -100, LOSAt: -100, LRAt: -100}
+			t = &Track{HitMe: -100, CalmAt: -100, HurtAt: -100, TPAt: -100, LOSAt: -100, LRAt: -100, LaserAt: -100}
 			tab[m.ID] = t
 		}
 		if (b.P.TPJoin > 0 || b.P.LRLaser > 0) && m.Kind == "mech" && now-t.Seen <= 0.5 && m.HP < t.HP-20 {
@@ -781,6 +790,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 	}
 	ffaOn := !b.pracOn && (!b.P.FFAStrict || (b.notPractice && (strictN <= 1 || b.maxUnexpl >= strictN)) || (b.P.CfgGate && b.P.CfgFFA && b.showCfg))
 	b.ffaNow = ffaOn
+	if b.P.LCDPunish > 0 {
+		b.noteLaserShots(o) // lcdpunish: who just fired a laser (state only)
+	}
 	st := &me.Stats
 	x, y, zf := me.Pos[0], me.Pos[1], me.Pos[2]
 	z := &o.Zone
@@ -909,6 +921,16 @@ func (b *Brain) step(o *Obs, act *Action) {
 		case aimed && t.Dist < 190:
 			t.Engage = true
 		}
+		if b.P.LCDPunish > 0 && !ffaOn && t.Kind == "mech" && holds(t.Weapons, "laser") {
+			// lcdpunish: punish the laser's cooldown, do not open into a ready laser (see LCDPunish).
+			if b.lcdWindow(t) && me.HP >= t.HP && t.LOS && t.Dist < b.reach(me) {
+				t.Engage = true
+			} else if t.Engage && !b.lcdWindow(t) && !aimed && t.HP >= 350 && !late && o.Alive > 2 && now-t.HitMe >= 6 {
+				if hit, ok := b.myHitAt[t.ID]; !ok || now-hit >= 6 {
+					t.Engage = false
+				}
+			}
+		}
 		if huntHide && t.Engage && !(t.Dist < b.P.EngageDist || now-t.HitMe < 4 || (aimed && t.Charging && t.Dist < 120) ||
 			(t.HP < 350 && t.Dist < 120) || o.Alive <= 2) {
 			t.Engage = false // squad engagement that giddy's FFA ghost rule would not take
@@ -931,6 +953,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		}
 		if now-t.HitMe < 4 {
 			s -= 40
+		}
+		if b.P.LCDPunish > 0 && !ffaOn && b.lcdWindow(t) && me.HP >= t.HP {
+			s -= 60 // lcdpunish: its laser is cooling down, take it now
 		}
 		if t.Closing > 3 {
 			s -= 15
@@ -1822,6 +1847,9 @@ func (b *Brain) prefRange(me *Self, t *Track) float64 {
 	if b.P.TPJoin > 0 && b.ffaNow && b.now-t.TPAt < 1.5 {
 		r = math.Max(r, t.OppDist+b.P.TPJoin) // tpjoin: stay the farther attacker
 	}
+	if b.P.LCDPunish > 0 && !b.ffaNow && b.lcdWindow(t) && me.HP >= t.HP {
+		r = math.Min(r, 50) // lcdpunish: close in while its laser cools down
+	}
 	return r
 }
 
@@ -2306,6 +2334,45 @@ func (b *Brain) earlyLosing(me *Self, hpFrac float64, gunOnly bool) bool {
 		}
 	}
 	return false
+}
+
+// noteLaserShots (lcdpunish) records when a tracked laser holder fired: a laser beam it fired (by id), or a laser
+// sound (near/mid) within 0.35 rad of the bearing of exactly one visible laser holder.
+func (b *Brain) noteLaserShots(o *Obs) {
+	for _, bm := range o.Beams {
+		if bm.Kind == "laser" {
+			if t := b.tracks[bm.By]; t != nil {
+				t.LaserAt = math.Max(t.LaserAt, b.now-bm.Age)
+			}
+		}
+	}
+	me := &o.Self
+	for _, snd := range o.Sounds {
+		if snd.Kind != "laser" || snd.Dist == "far" {
+			continue
+		}
+		var who *Track
+		n := 0
+		for _, t := range b.tracks {
+			if t.Kind == "mech" && t.Seen == b.now && holds(t.Weapons, "laser") &&
+				math.Abs(angDiff(math.Atan2(t.Pos[1]-me.Pos[1], t.Pos[0]-me.Pos[0]), snd.Bearing)) < 0.35 {
+				who, n = t, n+1
+			}
+		}
+		if n == 1 {
+			who.LaserAt = math.Max(who.LaserAt, b.now-snd.Age)
+		}
+	}
+}
+
+// lcdWindow (lcdpunish) reports whether t fired its laser less than LCDPunish s ago (capped at the configured
+// laser cooldown), so it cannot fire it again yet.
+func (b *Brain) lcdWindow(t *Track) bool {
+	w := b.P.LCDPunish
+	if cd := b.Cfg.Weapons["laser"].Cooldown; cd > 0 {
+		w = math.Min(w, cd)
+	}
+	return b.now-t.LaserAt < w
 }
 
 // cubeSkip (cubestop) says whether to skip a detour to the cube or crate at pos: only when CubeStop is on, the
@@ -3048,6 +3115,8 @@ func applyFlags(p *Params, spec string) {
 			p.DropAlive = int(f)
 		case "earlyretreat":
 			p.EarlyRetreat = f
+		case "lcdpunish":
+			p.LCDPunish = f
 		}
 	}
 }
@@ -3157,6 +3226,7 @@ func (b *Brain) safeFallback() {
 		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
 		p.FFADrops, p.CubeStop, p.EarlyRetreat = 0, false, 0
+		p.LCDPunish = 0
 	}
 	off(&b.base)
 	b.regenOn = false
