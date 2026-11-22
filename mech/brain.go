@@ -75,6 +75,9 @@ type Brain struct {
 	coverOK   bool
 
 	lastHurt float64
+	// armboost: when (match s + 1; 0 = never) and where the arm weapon run was last set.
+	abAt  float64
+	abPos [2]float64
 	// rescan: end of the current full spin, and when the last one started.
 	rsUntil, rsAt float64
 	hurtBearing   float64
@@ -330,6 +333,13 @@ type Params struct {
 	// distance) is worth x0.3; a pickup the zone reaches before our ETA + 8 s is skipped; and under fire we keep
 	// running to a weapon within 90 m when the foe, and every mech we see, is at least 70 m away.
 	ArmFirst bool
+	// ArmBoost [armboost]: ALL modes, while arm is active (gun-only, Arm on) and before 30 s: boost while walking to
+	// the arm weapon pickup (loot or armfirst's run under fire) when it is more than 25 m away and energy > 30.
+	// Opening weapons Table 3a: a 90-150 m run is 9.4-12.0 s walking vs 5.8-8.0 s boosting. false = off.
+	ArmBoost bool
+	// SqJink [sqjink]: SQUAD MODE ONLY (pracOn). fightMove's strafe always reverses, every 0.2-0.5 s, instead of
+	// giddy's 60% chance every 0.3-1.0 s. false = off.
+	SqJink bool
 	// GunOnlyR [gunonlyr]: with GunOnlyOut, only armed mechs closer than this count (0 = any range).
 	GunOnlyR float64
 	// CfgGate [cfggate]: allow the opening only when hello.config has the showdown/kit schedule (zone 560 m,
@@ -1554,6 +1564,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 				}
 			default:
 				mx, my = b.travel(me, lc.pos[0], lc.pos[1])
+				if lc.kind == "pickup" {
+					b.abAt, b.abPos = now+1, [2]float64{lc.pos[0], lc.pos[1]} // armboost (stored +1 so 0 = unset)
+				}
 				if lc.kind == "drop" && hyp(lc.pos[0]-x, lc.pos[1]-y) < 2.5 {
 					mx, my = 0, 0
 				}
@@ -1592,6 +1605,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 
 	if escJump {
 		act.Jump = true
+	}
+	if b.P.ArmBoost && b.abAt == now+1 && now < 30 && b.armActive(me) && me.Energy > 30 && (mx != 0 || my != 0) &&
+		hyp(b.abPos[0]-x, b.abPos[1]-y) > 25 {
+		boost = true // armboost: run to the weapon
 	}
 	if b.P.Dodge && mode != "unstuck" && mode != "escape" {
 		if dx, dy, lz := b.dodge(o); dx != 0 || dy != 0 {
@@ -2251,10 +2268,15 @@ func (b *Brain) fightMove(o *Obs, tg *Track, seen []*Track, wantLos float64) (fl
 	bd := hyp(bx, by) + 1e-9
 	ux, uy := bx/bd, by/bd
 	if b.now >= b.strafeUntil {
-		if b.rng.Float64() < 0.6 {
-			b.strafe = -b.strafe
+		if b.P.SqJink && b.pracOn {
+			b.strafe = -b.strafe // sqjink: always reverse, every 0.2-0.5 s
+			b.strafeUntil = b.now + 0.2 + b.rng.Float64()*0.3
+		} else {
+			if b.rng.Float64() < 0.6 {
+				b.strafe = -b.strafe
+			}
+			b.strafeUntil = b.now + 0.3 + b.rng.Float64()*0.7
 		}
-		b.strafeUntil = b.now + 0.3 + b.rng.Float64()*0.7
 	}
 	sx, sy := -uy*b.strafe, ux*b.strafe
 	tc := b.center(tg)
@@ -3648,6 +3670,7 @@ func (b *Brain) armRunUnderFire(o *Obs, me *Self, foe *Track, hpFrac float64, da
 		return false
 	}
 	*mx, *my = b.travel(me, lc.pos[0], lc.pos[1])
+	b.abAt, b.abPos = b.now+1, [2]float64{lc.pos[0], lc.pos[1]} // armboost (stored +1)
 	return true
 }
 
@@ -4113,6 +4136,10 @@ func applyFlags(p *Params, spec string) {
 			p.SqBackOpen = on
 		case "sqlrlaser":
 			p.SqLRLaser = f
+		case "armboost":
+			p.ArmBoost = on
+		case "sqjink":
+			p.SqJink = on
 		case "chargeengage":
 			p.ChargeEngage = f
 		case "earlyspace":
@@ -4289,6 +4316,7 @@ func (b *Brain) safeFallback() {
 		p.Arm, p.Scan, p.CubePush, p.ArmFirst = false, 0, 0, false
 		p.SqRim, p.SqLootIn, p.SqBand, p.SqRet = 0, 0, false, 0
 		p.SqSpeed, p.SqDodge = false, 0
+		p.ArmBoost, p.SqJink = false, false
 	}
 	off(&b.base)
 	b.regenOn = false
