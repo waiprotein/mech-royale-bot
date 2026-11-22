@@ -273,6 +273,40 @@ type Params struct {
 	// how far out of the next circle home spots are sampled (giddy 0.7 of its radius). 0 = giddy.
 	CrowdR   float64
 	HomeFrac float64
+
+	// Opening family (lab/opening), all off by default.
+	// Arm [arm]: the main chat's arming recipe (results/opening/FROM_MAIN.md #6). While gun-only and before
+	// ArmUntil [armuntil] (default 30 s): any ground laser/lightning within ArmR [armr] m (default 120; ArmRFar
+	// [armrfar], default 160, if no mech was tracked within 150 m in the last 5 s) is a loot candidate valued at
+	// least ArmV [armv] (default 400), nearest first, unless a mech tracked in the last 5 s is within ArmRoute
+	// [armroute] m (default 60) of the straight route; no gun fire at mechs beyond ArmFire [armfire] m (default
+	// 45) unless that mech hit us in the last 4 s; with no weapon candidate, ground crates within ArmCrate
+	// [armcrate] m (default 60) are valued 150. squadParams turns Arm off unless ArmPrac [armprac] is set
+	// (so by default it can change practice play only before PracAt).
+	Arm     bool
+	ArmPrac bool
+	// ArmStrict [armstrict]: arm acts only after giddy's detector has proven a free-for-all (b.notPractice: a
+	// death we did not cause), so practice play stays identical (footprint ~0, like FFAStrict).
+	ArmStrict bool
+	// ArmWin [armwin]: arm acts only while squad params are on (pracOn: from PracAt to the first death we did not
+	// cause, the FFA "aggression window") or after a proven free-for-all (notPractice); never in the first PracAt
+	// seconds before either. In practice that limits it to PracAt..ArmUntil while still gun-only.
+	ArmWin   bool
+	ArmUntil float64
+	ArmR     float64
+	ArmRFar  float64
+	ArmV     float64
+	ArmRoute float64
+	ArmFire  float64
+	ArmCrate float64
+	// Scan [scan]: for the first Scan s, when nothing else needs the aim, spin the torso at full turn rate so the
+	// 120 deg vision wedge sweeps all round and the bot learns the pickups near its spawn.
+	Scan float64
+	// CubePush [cubepush] / CubePushK [cubepushk]: FFA-only (ffaNow: after giddy's latch), until match time CubePush
+	// and below the cube stat cap, cubes and crates are worth CubePushK (default 2.5) times more in chooseLoot
+	// (cube 75 -> 188, crate 45 -> 113), to test the real-data marker "cubes at 60 s". 0 = off.
+	CubePush  float64
+	CubePushK float64
 	// GunOnlyR [gunonlyr]: with GunOnlyOut, only armed mechs closer than this count (0 = any range).
 	GunOnlyR float64
 	// CfgGate [cfggate]: allow the opening only when hello.config has the showdown/kit schedule (zone 560 m,
@@ -1499,6 +1533,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 				if gunOK && w.Ammo > 0 && w.Reload <= 0 && slew(gy, gp) {
 					act.Fire[i] = true
 				}
+				if isMech && target != nil && dist > dflt(b.P.ArmFire, 45) && now-target.HitMe >= 4 && b.armActive(me) {
+					act.Fire[i] = false // arm: while gun-only, do not open fire beyond ArmFire
+				}
 			case "lightning":
 				cone := w.Stats.ConeDeg * math.Pi / 180
 				if dist < w.Stats.Range-1.5 && math.Abs(angDiff(hy, me.Aim[0])) < cone*0.5-0.05 && me.Energy >= w.Stats.Energy {
@@ -1645,6 +1682,8 @@ func (b *Brain) step(o *Obs, act *Action) {
 		case b.P.FaceSound && ffaOn && target == nil && farm == nil && farmPos == nil && now-b.soundAt < 1.5:
 			// facesound: FFA-only (!pracOn); below watch/npc/hurt bearings, above the walking scan.
 			aim[0] = b.soundBearing
+		case b.P.Scan > 0 && now < b.P.Scan:
+			aim[0] = me.Aim[0] + 1.2 // scan: spin to learn the pickups around the spawn
 		case last != nil:
 			// watchlast: FFA-only; keep the last-seen mech in the 120° wedge with a ±52° sweep (above the scans).
 			aim[0] = math.Atan2(last.Pos[1]-y, last.Pos[0]-x) + 0.9*math.Sin(now*1.3)
@@ -2303,7 +2342,36 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 		}
 		return best
 	}
+	armOn := b.armActive(me)
+	armCand := false
+	armR := 0.0
+	if armOn {
+		armR = dflt(b.P.ArmRFar, 160)
+		for _, t := range b.tracks {
+			if now-t.Seen < 5 && hyp(t.Pos[0]-x, t.Pos[1]-y) < 150 {
+				armR = dflt(b.P.ArmR, 120)
+				break
+			}
+		}
+	}
 	for _, p := range b.pickups {
+		if armOn && (p.Kind == "laser" || p.Kind == "lightning") {
+			if !b.wantPickup(me, p.Kind) || hyp(p.Pos[0]-x, p.Pos[1]-y) >= armR {
+				continue
+			}
+			blocked := false
+			for _, t := range b.tracks {
+				if now-t.Seen < 5 && segDist(t.Pos[0], t.Pos[1], x, y, p.Pos[0], p.Pos[1]) < dflt(b.P.ArmRoute, 60) {
+					blocked = true
+					break
+				}
+			}
+			if !blocked {
+				armCand = true
+				consider("pickup", p.ID, p.Pos, dflt(b.P.ArmV, 400))
+			}
+			continue
+		}
 		rad := b.P.LootRadius
 		seek := p.Kind == "laser" && b.P.LaserSeek > rad
 		if seek {
@@ -2328,6 +2396,8 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 	cubeV := 75.0
 	if me.Cubes >= b.cubeCap() {
 		cubeV = 25
+	} else if b.P.CubePush > 0 && b.ffaNow && now < b.P.CubePush {
+		cubeV *= dflt(b.P.CubePushK, 2.5) // cubepush (crates use cubeV*0.6 below)
 	}
 	for _, c := range b.cubes {
 		if hyp(c.Pos[0]-x, c.Pos[1]-y) < math.Max(60, b.P.LootRadius*0.7) && !b.cubeSkip(me, c.Pos) {
@@ -2340,7 +2410,9 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 	}
 	if hpFrac > farmHP && !danger && now < b.P.CrateUntil {
 		for _, c := range b.crates {
-			if hyp(c.Pos[0]-x, c.Pos[1]-y) < b.P.LootRadius && !b.cubeSkip(me, c.Pos) {
+			if d := hyp(c.Pos[0]-x, c.Pos[1]-y); armOn && !armCand && d < dflt(b.P.ArmCrate, 60) && !b.cubeSkip(me, c.Pos) {
+				consider("crate", c.ID, c.Pos, 150) // arm: crate fallback (a crate drops a weapon half the time)
+			} else if d < b.P.LootRadius && !b.cubeSkip(me, c.Pos) {
 				consider("crate", c.ID, c.Pos, cubeV*0.6)
 			}
 		}
@@ -3026,6 +3098,39 @@ func (b *Brain) duelOdds(me *Self, t *Track) float64 {
 	return sig(0.94 + 4.0*math.Log(hpMe/hpThem) + 0.74*ind(meLaser) - 1.19*ind(themLaser) + 0.68*ind(themBack))
 }
 
+// armActive: the arming recipe (Arm) applies now: before ArmUntil and holding no second weapon.
+func (b *Brain) armActive(me *Self) bool {
+	if !b.P.Arm || b.now >= dflt(b.P.ArmUntil, 30) || (b.P.ArmStrict && !b.notPractice) ||
+		(b.P.ArmWin && !b.pracOn && !b.notPractice) {
+		return false
+	}
+	for i, w := range me.Weapons {
+		if w != nil && (i > 0 || w.Kind != "gun") {
+			return false
+		}
+	}
+	return true
+}
+
+// dflt returns v, or d when v is not set (<= 0).
+func dflt(v, d float64) float64 {
+	if v > 0 {
+		return v
+	}
+	return d
+}
+
+// segDist is the distance from (px, py) to the segment (ax, ay)-(bx, by).
+func segDist(px, py, ax, ay, bx, by float64) float64 {
+	dx, dy := bx-ax, by-ay
+	l2 := dx*dx + dy*dy
+	t := 0.0
+	if l2 > 1e-9 {
+		t = clamp(((px-ax)*dx+(py-ay)*dy)/l2, 0, 1)
+	}
+	return hyp(px-(ax+t*dx), py-(ay+t*dy))
+}
+
 // tpOpp (tpjoin) returns the mech t is fighting and its distance to t: the nearest other mech seen this tick
 // within 230 m of t that traded a beam with t this tick, or that t aims at / that aims at t (0.25 rad), where
 // the aim counts only if it is mutual or t lost HP to someone else in the last 2 s. Never us (not a track).
@@ -3143,6 +3248,8 @@ func squadParams(p Params) Params {
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
+	p.Arm = p.Arm && (p.ArmPrac || p.ArmWin)
+	p.CubePush = 0
 
 	return p
 }
@@ -3365,6 +3472,34 @@ func applyFlags(p *Params, spec string) {
 			p.FFAStrict = on
 		case "keeplaser":
 			p.KeepLaser = on
+		case "arm":
+			p.Arm = on
+		case "armprac":
+			p.ArmPrac = on
+		case "armstrict":
+			p.ArmStrict = on
+		case "armwin":
+			p.ArmWin = on
+		case "armuntil":
+			p.ArmUntil = f
+		case "armr":
+			p.ArmR = f
+		case "armrfar":
+			p.ArmRFar = f
+		case "armv":
+			p.ArmV = f
+		case "armroute":
+			p.ArmRoute = f
+		case "armfire":
+			p.ArmFire = f
+		case "armcrate":
+			p.ArmCrate = f
+		case "scan":
+			p.Scan = f
+		case "cubepush":
+			p.CubePush = f
+		case "cubepushk":
+			p.CubePushK = f
 		case "tpjoin":
 			p.TPJoin = f
 		case "tphp":
@@ -3526,6 +3661,7 @@ func (b *Brain) safeFallback() {
 		p.LaserLOS = 0
 		p.LCDPunish, p.LightPad, p.SmartFire = 0, 0, 0
 		p.CautiousT, p.PracRim = 0, 0
+		p.Arm, p.Scan, p.CubePush = false, 0, 0
 	}
 	off(&b.base)
 	b.regenOn = false
