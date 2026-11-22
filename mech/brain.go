@@ -133,6 +133,13 @@ type Brain struct {
 	// laserlos: when each mech was first seen charging a laser aimed at us (this charge); entries are dropped when it
 	// stops charging, aims away, fires (beam seen) or the charge must have auto-released.
 	lzSince map[int]float64
+	// threatfocus: per attacker id, decayed damage it dealt us and when that was last updated.
+	thrDmg map[int][2]float64
+	// cornercover: coverMove's search budget (candidate checks, path steps of 2 m); 0 = giddy's 350 / 50.
+	coverChecks, coverSteps int
+	ccFailAt                float64
+	// kitew: fightMove adds KiteW per metre of distance gained from the target while this is set (fight branch only).
+	kiteOn bool
 	// regenhide: latched while regenerating in cover, and when the latch started.
 	regenOn bool
 	regenAt float64
@@ -486,6 +493,21 @@ type Params struct {
 	// laser at full charge, or a short gun burst (<= 1 s, in ammo, within 60 m), kills it at that safety factor.
 	// The value is the safety factor (suggested 0.92: one unseen armour stack); 0 = off.
 	SmartFire float64
+	// ThreatFocus [threatfocus]: PRACTICE-side (only while !ffaOn). The house squad's members differ a lot in skill
+	// (aim tiers), so the mech that hurts us most is not the nearest or the weakest. Keep, per attacker id, the
+	// weapon damage it dealt us (damaged events) decayed with a 6 s time constant; its rate (HP/s, accumulated
+	// damage / 6) times ThreatFocus is subtracted from the target score (giddy's score is in metres: distance +
+	// HPw x HP - bonuses), so we turn on whoever is out-damaging us (Smith's rule: kill first what deals the most
+	// damage per second of our time). 0 = off (suggested 1-2).
+	ThreatFocus float64
+	// CornerCover [cornercover]: PRACTICE-side (only while !ffaOn). When we retreat (LoseRule / swamped / low HP)
+	// and coverMove finds no spot hidden from every mech seen in the last 2.5 s (it checks the 4 nearest, within
+	// ~30 m of path), giddy stands and fights ("cornered"), where we take about twice the damage rate of a normal
+	// fight. Instead, look for cover from only the CornerCover most dangerous mechs: those that see us now or hit us
+	// in the last 3 s, ranked by their recent damage rate on us (threatfocus bookkeeping) and then by distance.
+	// If such a spot exists, go there (mode "partcover", boost as for cover); else fight as before. 0 = off
+	// (suggested 2).
+	CornerCover int
 	// CautiousT [cautioust]: PRACTICE-side. From match time CautiousT s, or once the next zone circle is <= 72 m,
 	// squad (practice hunt) params switch off for the rest of the match and giddy's own cautious ghost play takes
 	// over (engage within EngageDist or when attacked, home spots in cover, our end-game hold-out). It acts only
@@ -520,6 +542,28 @@ type Params struct {
 	// overwrites the retreat flag every tick. SqRet adds a latch on top of LoseRule: below SqRet with a threat
 	// in the last 2 s we retreat until RecoverHP (0.8), or 7 s with no threat above 55%. 0 = off (squadrim: 0.30).
 	SqRet float64
+	// KiteBoost [kiteboost]: PRACTICE-side (only while !ffaOn). The house squad walks in to its own short range, where
+	// it hits us far more (sim traces: a visible house bot deals ~56 HP/s at 30-50 m, ~17 at 70-90 m, ~8 at
+	// 110-140 m) while our own damage holds up with range (laser exchange ratio ~2 at 30-50 m, 7-9 at 110-180 m).
+	// giddy's fightMove already backs off toward prefRange, but at walk speed, so a walking hunter keeps the gap.
+	// When the target is visible and more than 15 m inside our preferred range, fightMove's step has us moving away
+	// from it, our energy is above KiteBoost (and above 60 while we hold lightning, which needs energy to fire),
+	// and our laser is not charging (half speed), boost (19.5 vs 11.7 m/s). Not while finishing a target.
+	// 0 = off (suggested 30).
+	KiteBoost float64
+	// KiteW [kitew]: PRACTICE-side (only while !ffaOn), companion to KiteBoost. giddy's fightMove scores a 6 m step
+	// toward prefRange at 1.1/m but a sideways (strafe) step at 9, so it strafes instead of backing off and a
+	// walking hunter keeps the short range. While the mech target is visible and more than 15 m inside our preferred
+	// range (not finishing it), candidate steps also score KiteW per metre they add to the distance from it, so we
+	// actually back off (line of sight still scores 45). 0 = off (suggested 2.5).
+	KiteW float64
+	// PracRegen [pracregen]: PRACTICE-side (only while !ffaOn). RegenHide's latch for practice and the pre-latch
+	// window: below this HP share with no engaged target or foe (and not late), walk into cover from every mech seen
+	// in the last 20 s and stand still, with no loot run or crate/NPC shooting (dealing damage restarts the 5 s regen
+	// delay; regen is 45 HP/s), until 90% HP, 30 s, late, or a mode change. An engaged mech still gets fought (the
+	// fight branch runs first while foe != nil). Sim traces: squad engagements started below 70% HP end in our death
+	// within 15 s 22-39% of the time, against 7% from >= 90%. 0 = off (suggested 0.6).
+	PracRegen float64
 }
 
 func DefaultParams() Params {
@@ -558,7 +602,7 @@ func NewBrain(h *Hello, w *World) *Brain {
 		W: w, Cfg: h.Config, Slot: h.Slot, rng: rand.New(rand.NewSource(seed)), P: p,
 		tracks: map[int]*Track{}, npcs: map[int]*Track{}, crates: map[int]*known{}, cubes: map[int]*known{},
 		pickups: map[int]*known{}, bad: map[int]float64{}, strafe: 1, lootID: -1, lastHurt: -100, lastThreatAt: -100,
-		holdStart: -1, soundAt: -100,
+		holdStart: -1, soundAt: -100, ccFailAt: -100,
 	}
 }
 
@@ -726,6 +770,9 @@ func (b *Brain) observe(o *Obs) {
 				}
 				if t := b.tracks[*e.By]; t != nil {
 					t.HitMe = now
+				}
+				if (b.P.ThreatFocus > 0 || b.P.CornerCover > 0) && e.Weapon != "npc" && e.Weapon != "zone" {
+					b.noteThreat(*e.By, e.Amount, now) // threatfocus / cornercover (state only)
 				}
 				if n := b.npcs[*e.By]; n != nil {
 					n.HitMe = now
@@ -1130,6 +1177,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		if b.P.LCDPunish > 0 && !ffaOn && b.lcdWindow(t) && me.HP >= t.HP {
 			s -= 60 // lcdpunish: its laser is cooling down, take it now
 		}
+		if b.P.ThreatFocus > 0 && !ffaOn {
+			s -= b.P.ThreatFocus * b.threatRate(t.ID) // threatfocus: whoever is out-damaging us first
+		}
 		if t.Closing > 3 {
 			s -= 15
 		}
@@ -1265,7 +1315,12 @@ func (b *Brain) step(o *Obs, act *Action) {
 	if ((b.P.RegenHide > 0 && ffaOn && hpFrac < b.P.RegenHide) || (sqRegen && hpFrac < 0.5)) && !late && !b.regenOn && foe == nil {
 		b.regenOn, b.regenAt = true, now
 	}
-	if b.regenOn && (!((b.P.RegenHide > 0 && ffaOn) || sqRegen) || late || hpFrac >= 0.9 || now-b.regenAt > 30) {
+	// pracregen: the same latch while !ffaOn (practice / pre-latch), below PracRegen.
+	if b.P.PracRegen > 0 && !ffaOn && !late && !b.regenOn && hpFrac < b.P.PracRegen && foe == nil {
+		b.regenOn, b.regenAt = true, now
+	}
+	regenOK := (b.P.RegenHide > 0 && ffaOn) || sqRegen || (b.P.PracRegen > 0 && !ffaOn)
+	if b.regenOn && (!regenOK || late || hpFrac >= 0.9 || now-b.regenAt > 30) {
 		b.regenOn = false
 	}
 
@@ -1312,6 +1367,11 @@ func (b *Brain) step(o *Obs, act *Action) {
 		if b.coverMove(o, seen, &mx, &my) {
 			boost = me.Energy > 10 && (mx != 0 || my != 0)
 			mode = "cover"
+		} else if b.P.CornerCover > 0 && !ffaOn && b.cornerCover(o, seen, &mx, &my) {
+			// cornercover (practice / pre-latch only): no cover close by, so search farther, then hide from the
+			// worst attackers only.
+			boost = me.Energy > 10 && (mx != 0 || my != 0)
+			mode = "partcover"
 		} else if target != nil {
 			mx, my = b.fightMove(o, target, seen, 1)
 			mode = "cornered"
@@ -1420,8 +1480,13 @@ func (b *Brain) step(o *Obs, act *Action) {
 			if b.P.LRLaser > 0 && b.P.LRKeep > 0 && ffaOn && laser != nil {
 				b.P.LaserRange = math.Max(b.P.LaserRange, b.P.LRKeep) // lrkeep: fight from long laser range
 			}
+			b.kiteOn = b.P.KiteW > 0 && !ffaOn && !finishing && foe.Kind == "mech" && foe.Seen == now && foe.Dist < b.prefRange(me, foe)-15
 			mx, my = b.fightMove(o, foe, seen, wantLos)
+			b.kiteOn = false
 			b.P = keep
+			if b.P.KiteBoost > 0 && !ffaOn && !finishing && b.kiteAway(me, foe, mx, my, light != nil, laser) {
+				boost = true // kiteboost (practice / pre-latch only): back off to our range at boost speed
+			}
 		}
 		if light != nil && foe.Dist > 50 && me.Energy > 55 && wantLos > 0 {
 			boost = true
@@ -2216,6 +2281,9 @@ func (b *Brain) fightMove(o *Obs, tg *Track, seen []*Track, wantLos float64) (fl
 			dev = math.Max(0, math.Max(lo-d, d-hi))
 		}
 		s := -1.1*dev - r*0.4
+		if b.kiteOn {
+			s += b.P.KiteW * (d - bd) // kitew: back off from a target well inside our range
+		}
 		los := b.W.Clear(Vec3{cx, cy, cz + mh}, tc)
 		if los {
 			s += 45 * wantLos
@@ -2335,11 +2403,15 @@ func (b *Brain) coverMove(o *Obs, seen []*Track, mx, my *float64) bool {
 	w.g[s] = 0
 	bestC, bestS := -1, math.Inf(1)
 	checked := 0
-	for h := 0; h < len(queue) && checked < 350; h++ {
+	maxChecks, maxSteps := 350, 50.0
+	if b.coverChecks > 0 {
+		maxChecks, maxSteps = b.coverChecks, float64(b.coverSteps) // cornercover: wider search
+	}
+	for h := 0; h < len(queue) && checked < maxChecks; h++ {
 		c := int(queue[h])
 		ci, cj := c%w.NNX, c/w.NNX
 		steps := float64(w.g[c])
-		if steps > 50 || (bestC >= 0 && steps*2 > bestS+30) {
+		if steps > maxSteps || (bestC >= 0 && steps*2 > bestS+30) {
 			break
 		}
 		if (ci+cj)%2 == 0 && steps > 0 {
@@ -2875,6 +2947,27 @@ func (b *Brain) squadRimSpot(z *Zone, x, y float64) (float64, float64) {
 
 // lightReach (lightpad) is the distance we keep from lightning holders: weapons.lightning.range (45 m if
 // missing) plus LightPad.
+// threatTau is threatfocus's decay time constant (s).
+const threatTau = 6.0
+
+// noteThreat adds amount to attacker id's decayed damage (threatfocus).
+func (b *Brain) noteThreat(id int, amount, now float64) {
+	if b.thrDmg == nil {
+		b.thrDmg = map[int][2]float64{}
+	}
+	r := b.thrDmg[id]
+	b.thrDmg[id] = [2]float64{r[0]*math.Exp(-(now-r[1])/threatTau) + amount, now}
+}
+
+// threatRate is attacker id's recent damage rate on us in HP/s (decayed damage / threatTau; threatfocus).
+func (b *Brain) threatRate(id int) float64 {
+	r, ok := b.thrDmg[id]
+	if !ok {
+		return 0
+	}
+	return r[0] * math.Exp(-(b.now-r[1])/threatTau) / threatTau
+}
+
 func (b *Brain) lightReach() float64 {
 	lr := b.Cfg.Weapons["lightning"].Range
 	if lr <= 0 {
@@ -3302,6 +3395,62 @@ func (b *Brain) canFire(me *Self, gun, laser, light *WeaponState, target *Track)
 }
 
 // losNow (coverreload) returns the tracks seen this tick that have a clear line to us.
+// kiteAway (kiteboost): the visible mech target t is more than 15 m inside our preferred range, the move (mx, my)
+// leads away from it, our energy is above KiteBoost (60 with lightning) and our laser is not charging.
+func (b *Brain) kiteAway(me *Self, t *Track, mx, my float64, light bool, laser *WeaponState) bool {
+	if t.Kind != "mech" || t.Seen != b.now || me.Energy <= b.P.KiteBoost || (light && me.Energy <= 60) ||
+		(laser != nil && laser.Charge > 0) {
+		return false
+	}
+	if t.Dist >= b.prefRange(me, t)-15 {
+		return false
+	}
+	dx, dy := t.Pos[0]-me.Pos[0], t.Pos[1]-me.Pos[1]
+	m, d := hyp(mx, my), hyp(dx, dy)
+	return m > 0.1 && d > 0.1 && (mx*dx+my*dy)/(m*d) < -0.3
+}
+
+// cornerCover (cornercover) runs after giddy's coverMove found nothing: a wider search (up to 1000 candidate
+// spots, 70 m of path) for a spot hidden from every recent mech, then from the CornerCover worst attackers only.
+// A failed attempt is not repeated for 0.3 s (CPU), so in between we fight as giddy does.
+func (b *Brain) cornerCover(o *Obs, seen []*Track, mx, my *float64) bool {
+	if b.now-b.ccFailAt < 0.3 {
+		return false
+	}
+	b.coverChecks, b.coverSteps = 1000, 35
+	defer func() { b.coverChecks, b.coverSteps = 0, 0 }()
+	if b.coverMove(o, seen, mx, my) {
+		return true
+	}
+	if th := b.cornerThreats(seen, b.P.CornerCover); len(th) > 0 && b.coverMove(o, th, mx, my) {
+		return true
+	}
+	b.ccFailAt = b.now
+	return false
+}
+
+// cornerThreats (cornercover): the n most dangerous of the mechs that see us now (LOS this tick) or hit us in the
+// last 3 s: highest recent damage rate on us first (threatRate), then nearest.
+func (b *Brain) cornerThreats(seen []*Track, n int) []*Track {
+	var out []*Track
+	for _, t := range seen {
+		if (t.Seen == b.now && t.LOS) || b.now-t.HitMe < 3 {
+			out = append(out, t)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := b.threatRate(out[i].ID), b.threatRate(out[j].ID)
+		if ri != rj {
+			return ri > rj
+		}
+		return out[i].Dist < out[j].Dist
+	})
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
+}
+
 func losNow(seen []*Track, now float64) []*Track {
 	var out []*Track
 	for _, t := range seen {
@@ -3976,6 +4125,10 @@ func applyFlags(p *Params, spec string) {
 			p.LightPad = f
 		case "smartfire":
 			p.SmartFire = f
+		case "threatfocus":
+			p.ThreatFocus = f
+		case "cornercover":
+			p.CornerCover = int(f)
 		case "cautioust":
 			p.CautiousT = f
 		case "pracrim":
@@ -3994,6 +4147,12 @@ func applyFlags(p *Params, spec string) {
 			p.SqBand = on
 		case "sqret":
 			p.SqRet = f
+		case "kiteboost":
+			p.KiteBoost = f
+		case "kitew":
+			p.KiteW = f
+		case "pracregen":
+			p.PracRegen = f
 		}
 	}
 }
@@ -4109,6 +4268,7 @@ func (b *Brain) safeFallback() {
 		p.FFADrops, p.CubeStop, p.EarlyRetreat = 0, false, 0
 		p.LaserLOS = 0
 		p.LCDPunish, p.LightPad, p.SmartFire = 0, 0, 0
+		p.ThreatFocus, p.CornerCover, p.KiteBoost, p.KiteW, p.PracRegen = 0, 0, 0, 0, 0
 		p.CautiousT, p.PracRim = 0, 0
 		p.Arm, p.Scan, p.CubePush, p.ArmFirst = false, 0, 0, false
 		p.SqRim, p.SqLootIn, p.SqBand, p.SqRet = 0, 0, false, 0
