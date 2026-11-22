@@ -456,6 +456,18 @@ type Params struct {
 	// open on a laser holder: a fresh one (no hits either way for 6 s) that is not aiming at us, not below 350 HP
 	// and not in the end game is not engaged. 0 = off (suggested 1.5, a little under the cooldown).
 	LCDPunish float64
+	// SqBackOpen [sqbackopen]: SQUAD MODE ONLY (pracOn). House-bot lobby study: opening on a house bot facing more
+	// than 1 rad away wins 82% vs 58% facing us; opening below 0.8x its HP wins 28%. Engage (and score -60) a seen mech
+	// with LOS whose aim is > 1.0 rad off us, within our reach, when our HP >= 0.8x its HP. Do not open on a mech
+	// aiming at us (giddy's 0.22 rad) while our HP < 0.8x its HP and neither side hit the other in 6 s (not late):
+	// it is dropped from engagement and, with no target, we break its LOS (coverMove). false = off.
+	SqBackOpen bool
+	// SqLRLaser [sqlrlaser]: SQUAD MODE ONLY (pracOn). lrlaser's long-range opener in squad mode: with a ready laser
+	// and HP >= its HP, open on a seen mech with LOS at EngageDist..min(SqLRLaser, MaxTarget) m whose aim is > 1.0 rad
+	// off us (or, if it faces us, that is busy with another mech), at most 1 other mech within 150 m; follow through
+	// 4 s after each hit. Also a regenhide-style latch below 50% HP with no foe: cover from mechs seen in 20 s,
+	// stand still to 90%. 0 = off.
+	SqLRLaser float64
 	// LightPad [lightpad]: PRACTICE-side (only while !ffaOn). Lightning hits only within weapons.lightning.range
 	// (45 m) of its 30 degree cone, so stay farther than range + LightPad m from mechs holding it: the preferred
 	// fight range against a lightning holder is at least that (also when we hold lightning ourselves, and when
@@ -929,6 +941,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 
 	var seen []*Track
 	var target, hidden, shy *Track
+	var sqAvoid []*Track // sqbackopen: mechs facing us that we must not open on (break their LOS)
 	var chargeFoe *Track // chargeengage: nearest long-range charger engaged only by that flag
 	bestScore := math.Inf(1)
 	maxT, hpw := 215.0, 60.0/1400
@@ -963,6 +976,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 		}
 		toMe := math.Atan2(y-t.Pos[1], x-t.Pos[0])
 		aimed := math.Abs(angDiff(t.Aim[0], toMe)) < 0.22
+		offAim := math.Abs(angDiff(t.Aim[0], toMe))
 		switch {
 		case b.P.Ghost:
 
@@ -1032,6 +1046,29 @@ func (b *Brain) step(o *Obs, act *Action) {
 		case aimed && t.Dist < 190:
 			t.Engage = true
 		}
+		if b.P.SqBackOpen && b.pracOn && t.Kind == "mech" {
+			// sqbackopen: open on backs, never open from behind on HP into a mech facing us.
+			if offAim > 1.0 && t.LOS && t.Dist < b.reach(me) && me.HP >= 0.8*t.HP {
+				t.Engage = true
+			}
+			hit, ok := b.myHitAt[t.ID]
+			fresh := now-t.HitMe >= 6 && (!ok || now-hit >= 6)
+			if fresh && aimed && me.HP < 0.8*t.HP && !late && o.Alive > 2 {
+				t.Engage = false
+				sqAvoid = append(sqAvoid, t)
+			}
+		}
+		if b.P.SqLRLaser > 0 && b.pracOn && t.Kind == "mech" && !t.Engage {
+			// sqlrlaser: squad-mode long-range laser opener on an unaware (or busy) mech.
+			if b.sqLROpen(o, me, t, laser, offAim, maxT) {
+				t.LRAt = now
+			}
+			hit, ok := b.myHitAt[t.ID]
+			follow := ok && now-hit < 4 && now-t.LRAt < 12 && me.HP >= t.HP && t.Dist <= math.Min(b.P.SqLRLaser, maxT) && !b.retreat
+			if now-t.LRAt < 1.5 || follow {
+				t.Engage = true
+			}
+		}
 		if b.P.LCDPunish > 0 && !ffaOn && t.Kind == "mech" && holds(t.Weapons, "laser") {
 			// lcdpunish: punish the laser's cooldown, do not open into a ready laser (see LCDPunish).
 			if b.lcdWindow(t) && me.HP >= t.HP && t.LOS && t.Dist < b.reach(me) {
@@ -1070,6 +1107,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		}
 		if t.Closing > 3 {
 			s -= 15
+		}
+		if b.P.SqBackOpen && b.pracOn && offAim > 1.0 {
+			s -= 60 // sqbackopen: its back is turned
 		}
 		if s < bestScore {
 			bestScore, target = s, t
@@ -1179,10 +1219,11 @@ func (b *Brain) step(o *Obs, act *Action) {
 	}
 	// regenhide: FFA-only. Latch below RegenHide with no target/foe; release at 90% HP, after 30 s, when late or
 	// when FFA play stops (see RegenHide).
-	if b.P.RegenHide > 0 && ffaOn && !late && !b.regenOn && hpFrac < b.P.RegenHide && foe == nil {
+	sqRegen := b.P.SqLRLaser > 0 && b.pracOn // sqlrlaser: regenhide-style latch in squad mode below 50% HP
+	if ((b.P.RegenHide > 0 && ffaOn && hpFrac < b.P.RegenHide) || (sqRegen && hpFrac < 0.5)) && !late && !b.regenOn && foe == nil {
 		b.regenOn, b.regenAt = true, now
 	}
-	if b.regenOn && (b.P.RegenHide <= 0 || !ffaOn || late || hpFrac >= 0.9 || now-b.regenAt > 30) {
+	if b.regenOn && (!((b.P.RegenHide > 0 && ffaOn) || sqRegen) || late || hpFrac >= 0.9 || now-b.regenAt > 30) {
 		b.regenOn = false
 	}
 
@@ -1279,6 +1320,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 		mode = "earlyspace" // walk away from the nearest recently seen mech until it is EarlySpaceKeep m away
 	case foe != nil && b.armRunUnderFire(o, me, foe, hpFrac, danger, &mx, &my):
 		mode = "arm:underfire" // armfirst: keep running to a weapon while the shooter is far
+	case len(sqAvoid) > 0 && target == nil && !finishing && b.coverMove(o, sqAvoid, &mx, &my):
+		boost = me.Energy > 20 && (mx != 0 || my != 0)
+		mode = "sqavoid" // sqbackopen: break the LOS of a facing mech we are too weak to open on
 	case foe != nil:
 
 		ready := gun != nil && gun.Ammo > 0 && gun.Reload <= 0.25 && foe.Dist <= gun.Stats.Range-10
@@ -3412,6 +3456,34 @@ func (b *Brain) lrOpen(o *Obs, me *Self, t *Track, laser *WeaponState, aimed boo
 	return true
 }
 
+// sqLROpen (sqlrlaser) is lrOpen for squad mode: range SqLRLaser, HP >= its HP, "not noticed" = aim > 1.0 rad off us.
+func (b *Brain) sqLROpen(o *Obs, me *Self, t *Track, laser *WeaponState, off, maxT float64) bool {
+	if laser == nil || laser.Cooldown > 0.3 || t.Seen != b.now || !t.LOS || b.retreat || b.now < b.oddsFleeUntil {
+		return false
+	}
+	if t.Dist < b.P.EngageDist || t.Dist > math.Min(b.P.SqLRLaser, maxT) || me.HP < t.HP {
+		return false
+	}
+	if t.Charging && off < 0.5 {
+		return false
+	}
+	others := 0
+	for _, u := range b.tracks {
+		if u != t && u.Seen == b.now && u.Dist < 150 {
+			others++
+		}
+	}
+	if others > 1 {
+		return false
+	}
+	if off <= 1.0 {
+		if opp, _ := b.tpOpp(o, t); opp == nil {
+			return false
+		}
+	}
+	return true
+}
+
 func squadParams(p Params) Params {
 	p.Ghost = false
 	p.Peek = false
@@ -3737,6 +3809,10 @@ func applyFlags(p *Params, spec string) {
 			p.HomeLOS = f
 		case "rescan":
 			p.Rescan = on
+		case "sqbackopen":
+			p.SqBackOpen = on
+		case "sqlrlaser":
+			p.SqLRLaser = f
 		case "chargeengage":
 			p.ChargeEngage = f
 		case "earlyspace":
@@ -3877,6 +3953,7 @@ func (b *Brain) safeFallback() {
 		p.LateR, p.HoldOut = 70, 0
 		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
+		p.SqBackOpen, p.SqLRLaser = false, 0
 		p.EarlySpace, p.EarlySpaceR, p.EarlySpaceKeep = 0, 0, 0
 		p.Rescan = false
 		p.RearAvoid, p.CoverReload = 0, false
