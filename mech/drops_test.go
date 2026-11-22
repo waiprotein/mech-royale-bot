@@ -133,6 +133,36 @@ func TestFFADropsGuards(t *testing.T) {
 	if b.Mode == "loot:drop" || b.bad[dropID] < 80.2+7.9 {
 		t.Fatalf("committed drop kept after a mech hit us (mode %s, bad %v)", b.Mode, b.bad[dropID])
 	}
+	// below 50% HP with a mech seen within 200 m in the last 5 s: skip; with that mech at 230 m: go
+	b = dropBrain(true, true)
+	o = dropObs(80, 20, bystander(180))
+	o.Self.HP, o.Self.Vel = 600, Vec3{0, 11.7, 0}
+	dropAct(t, b, o)
+	if b.lootID == dropID {
+		t.Fatalf("went for a drop at 43%% HP with a mech seen at 180 m")
+	}
+	b = dropBrain(true, true)
+	o = dropObs(80, 20, bystander(230))
+	o.Self.HP, o.Self.Vel = 600, Vec3{0, 11.7, 0}
+	dropAct(t, b, o)
+	if b.lootID != dropID {
+		t.Fatalf("skipped a drop at 43%% HP with the nearest mech at 230 m (lootID %d, mode %s)", b.lootID, b.Mode)
+	}
+	// dropalive=8: skip with 7 alive, go with 10 (lrObs has Alive 10)
+	b = dropBrain(true, true)
+	b.P.DropAlive = 8
+	o = dropObs(80, 20)
+	o.Alive = 7
+	dropAct(t, b, o)
+	if b.lootID == dropID {
+		t.Fatalf("dropalive=8 went for a drop with 7 alive")
+	}
+	b = dropBrain(true, true)
+	b.P.DropAlive = 8
+	dropAct(t, b, dropObs(80, 20))
+	if b.lootID != dropID {
+		t.Fatalf("dropalive=8 skipped a drop with 10 alive")
+	}
 	// another mech holds the capture clock: skip
 	b = dropBrain(true, true)
 	o = dropObs(80, 0)

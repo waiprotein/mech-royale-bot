@@ -336,6 +336,16 @@ type Params struct {
 	// A drop gives full HP, full energy and 3 cubes for 4 s alone in its 8 m ring. UseDrops itself is not
 	// mode-gated and stays off (it would change practice play).
 	FFADrops bool
+	// DropAlive [dropalive]: with FFADrops, go for a drop only while at least this many mechs are alive (0 = no
+	// limit). Real showdowns (Spawn chat, L9): ring entries carry about +0.2 extra death within 30 s, most with
+	// few mechs left; >= 8 keeps the 70 s drop (sometimes the 140 s one) and skips the 210 s one. Unproven.
+	DropAlive int
+	// CubeStop [cubestop]: FFA-only (ffaOn). At or above the cube stat cap (cubes.stat_cap, 10) more cubes add no HP
+	// or damage but keep growing us (+5% size each, no cap), and real showdowns show such mechs hit far more often.
+	// So stop detouring for cubes and crates there (loot choice, fight-mode cube grabs, the in-fight strafe toward
+	// a cube), except a cube or crate within 40 m when the next upgrade threshold (cubes.upgrade_thresholds) is
+	// at most 2 cubes away. Cubes we walk over are still picked up.
+	CubeStop bool
 }
 
 func DefaultParams() Params {
@@ -1136,7 +1146,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 			}
 			var bc *Vec3
 			for _, c := range b.cubes {
-				if d := hyp(c.Pos[0]-x, c.Pos[1]-y); d < r {
+				if d := hyp(c.Pos[0]-x, c.Pos[1]-y); d < r && !b.cubeSkip(me, c.Pos) {
 					r = d
 					cp := c.Pos
 					bc = &cp
@@ -1794,7 +1804,7 @@ func (b *Brain) fightMove(o *Obs, tg *Track, seen []*Track, wantLos float64) (fl
 	mh := me.Stats.MuzzleHeight
 	var cube *known
 	for _, c := range b.cubes {
-		if d := hyp(c.Pos[0]-x, c.Pos[1]-y); d < 40 && (cube == nil || d < hyp(cube.Pos[0]-x, cube.Pos[1]-y)) && math.Abs(c.Pos[2]-me.Pos[2]) < 4 {
+		if d := hyp(c.Pos[0]-x, c.Pos[1]-y); d < 40 && (cube == nil || d < hyp(cube.Pos[0]-x, cube.Pos[1]-y)) && math.Abs(c.Pos[2]-me.Pos[2]) < 4 && !b.cubeSkip(me, c.Pos) {
 			cube = c
 		}
 	}
@@ -2069,12 +2079,12 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 			consider("pickup", p.ID, p.Pos, v)
 		}
 		for _, c := range b.cubes {
-			if !hurt || hyp(c.Pos[0]-x, c.Pos[1]-y) < 35 {
+			if (!hurt || hyp(c.Pos[0]-x, c.Pos[1]-y) < 35) && !b.cubeSkip(me, c.Pos) {
 				consider("cube", c.ID, c.Pos, 110)
 			}
 		}
 		for _, c := range b.crates {
-			if !hurt || hyp(c.Pos[0]-x, c.Pos[1]-y) < 35 {
+			if (!hurt || hyp(c.Pos[0]-x, c.Pos[1]-y) < 35) && !b.cubeSkip(me, c.Pos) {
 				consider("crate", c.ID, c.Pos, 105)
 			}
 		}
@@ -2134,7 +2144,7 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 		cubeV = 25
 	}
 	for _, c := range b.cubes {
-		if hyp(c.Pos[0]-x, c.Pos[1]-y) < math.Max(60, b.P.LootRadius*0.7) {
+		if hyp(c.Pos[0]-x, c.Pos[1]-y) < math.Max(60, b.P.LootRadius*0.7) && !b.cubeSkip(me, c.Pos) {
 			consider("cube", c.ID, c.Pos, cubeV)
 		}
 	}
@@ -2144,7 +2154,7 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 	}
 	if hpFrac > farmHP && !danger && now < b.P.CrateUntil {
 		for _, c := range b.crates {
-			if hyp(c.Pos[0]-x, c.Pos[1]-y) < b.P.LootRadius {
+			if hyp(c.Pos[0]-x, c.Pos[1]-y) < b.P.LootRadius && !b.cubeSkip(me, c.Pos) {
 				consider("crate", c.ID, c.Pos, cubeV*0.6)
 			}
 		}
@@ -2182,6 +2192,7 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 // behaviour. FFADrops (ffadrops) allows it only after a proven free-for-all (ffaOn), and only when:
 //   - no other mech is capturing it (holder);
 //   - no mech has hit us in the last 3 s and no mech seen this tick is within 100 m;
+//   - below 50% HP, no mech seen within 200 m in the last 5 s (a capture means standing still for 4 s);
 //   - to commit, no mech seen this tick is within 150 m. We stay committed only while the drop is our loot target
 //     and passed on the previous decision; any tick spent in another mode (dodge, unstuck, fight...) ends the
 //     commitment, so resuming needs the 150 m check again.
@@ -2198,12 +2209,16 @@ func (b *Brain) dropsOK(o *Obs, d *Drop) bool {
 	if d.Holder != nil && *d.Holder != o.Self.ID {
 		return false
 	}
+	if b.P.DropAlive > 0 && o.Alive < b.P.DropAlive {
+		return false
+	}
 	committed := b.lootID == d.ID && b.now-b.dropOKAt < 0.15
+	low := o.Self.HP < 0.5*math.Max(1, o.Self.MaxHP)
 	for _, t := range b.tracks {
 		if t.Kind != "mech" {
 			continue
 		}
-		threat := b.now-t.HitMe < 3 || (t.Seen == b.now && t.Dist < 100)
+		threat := b.now-t.HitMe < 3 || (t.Seen == b.now && t.Dist < 100) || (low && b.now-t.Seen < 5 && t.Dist < 200)
 		if threat || (!committed && t.Seen == b.now && t.Dist < 150) {
 			if committed {
 				b.bad[d.ID] = b.now + 8
@@ -2213,6 +2228,31 @@ func (b *Brain) dropsOK(o *Obs, d *Drop) bool {
 	}
 	if b.lootID == d.ID || committed {
 		b.dropOKAt = b.now
+	}
+	return true
+}
+
+// cubeSkip (cubestop) says whether to skip a detour to the cube or crate at pos: only when CubeStop is on, the
+// match is a proven FFA (ffaOn) and we hold at least cubes.stat_cap cubes, unless the next upgrade threshold is at
+// most 2 cubes away and pos is within 40 m.
+func (b *Brain) cubeSkip(me *Self, pos Vec3) bool {
+	if !b.P.CubeStop || !b.ffaNow {
+		return false
+	}
+	capC := b.Cfg.Cubes.StatCap
+	if capC <= 0 {
+		capC = 10
+	}
+	if me.Cubes < capC {
+		return false
+	}
+	for _, th := range b.Cfg.Cubes.UpgradeThresholds {
+		if th > me.Cubes {
+			if th-me.Cubes <= 2 && hyp(pos[0]-me.Pos[0], pos[1]-me.Pos[1]) <= 40 {
+				return false
+			}
+			break
+		}
 	}
 	return true
 }
@@ -2668,7 +2708,7 @@ func squadParams(p Params) Params {
 	p.TPJoin, p.BackOpen, p.PreCharge, p.PeekCD = 0, 0, 0, 0
 	p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 	p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
-	p.FFADrops = false
+	p.FFADrops, p.CubeStop = false, false
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -2914,6 +2954,10 @@ func applyFlags(p *Params, spec string) {
 			p.ChargeEngage = f
 		case "ffadrops":
 			p.FFADrops = on
+		case "cubestop":
+			p.CubeStop = on
+		case "dropalive":
+			p.DropAlive = int(f)
 		}
 	}
 }
@@ -3022,7 +3066,7 @@ func (b *Brain) safeFallback() {
 		p.LateR, p.HoldOut = 70, 0
 		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
-		p.FFADrops = false
+		p.FFADrops, p.CubeStop = false, false
 	}
 	off(&b.base)
 	b.regenOn = false
