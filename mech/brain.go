@@ -542,6 +542,15 @@ type Params struct {
 	// overwrites the retreat flag every tick. SqRet adds a latch on top of LoseRule: below SqRet with a threat
 	// in the last 2 s we retreat until RecoverHP (0.8), or 7 s with no threat above 55%. 0 = off (squadrim: 0.30).
 	SqRet float64
+	// SqSpeed [sqspeed] / SqDodge [sqdodge]: PRACTICE-side, act only while !ffaOn (practice squad play AND the
+	// pre-latch window, including the FFA final before the latch; after it, giddy's ffaOn-gated SpeedUp/DodgeBoost
+	// flags apply as before). House guns deal most of their damage inside 100 m, so speed and evasive boosts should
+	// pay against the squad. SqSpeed: pick upgrades in SpeedUp's order (servos, jets, reactor after plating/armor).
+	// SqDodge: when dodge moves us off a shot, boost if energy > SqDodge (DodgeBoost's rule). Not touched by
+	// squadParams. Old-scorer board signal: S8 speedup 5.73, S7 dodgeboost=25 5.63 vs plain giddy salt mean 5.41
+	// (sd 0.12). Off by default (suggested sqspeed=1, sqdodge=25).
+	SqSpeed bool
+	SqDodge float64
 	// KiteBoost [kiteboost]: PRACTICE-side (only while !ffaOn). The house squad walks in to its own short range, where
 	// it hits us far more (sim traces: a visible house bot deals ~56 HP/s at 30-50 m, ~17 at 70-90 m, ~8 at
 	// 110-140 m) while our own damage holds up with range (laser exchange ratio ~2 at 30-50 m, 7-9 at 110-180 m).
@@ -994,7 +1003,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 	hpFrac := me.HP / math.Max(1, me.MaxHP)
 
 	if o.Offer != nil && len(o.Offer.Choices) > 0 {
-		p := pickUpgrade(o.Offer, b.P.LaserUp, b.P.NanoUp, b.P.SpeedUp && ffaOn)
+		p := pickUpgrade(o.Offer, b.P.LaserUp, b.P.NanoUp, (b.P.SpeedUp && ffaOn) || (b.P.SqSpeed && !ffaOn)) // sqspeed
 		act.Pick = &p
 	}
 
@@ -1595,6 +1604,9 @@ func (b *Brain) step(o *Obs, act *Action) {
 			}
 			if b.P.DodgeBoost > 0 && ffaOn && me.Energy > b.P.DodgeBoost {
 				boost = true
+			}
+			if b.P.SqDodge > 0 && !ffaOn && me.Energy > b.P.SqDodge {
+				boost = true // sqdodge: DodgeBoost's rule while !ffaOn
 			}
 		}
 	}
@@ -3999,6 +4011,10 @@ func applyFlags(p *Params, spec string) {
 			p.FightBoost = f
 		case "dodgeboost":
 			p.DodgeBoost = f
+		case "sqspeed":
+			p.SqSpeed = on
+		case "sqdodge":
+			p.SqDodge = f
 		case "threatboost":
 			p.ThreatBoost = f
 		case "opening":
@@ -4272,6 +4288,7 @@ func (b *Brain) safeFallback() {
 		p.CautiousT, p.PracRim = 0, 0
 		p.Arm, p.Scan, p.CubePush, p.ArmFirst = false, 0, 0, false
 		p.SqRim, p.SqLootIn, p.SqBand, p.SqRet = 0, 0, false, 0
+		p.SqSpeed, p.SqDodge = false, 0
 	}
 	off(&b.base)
 	b.regenOn = false
