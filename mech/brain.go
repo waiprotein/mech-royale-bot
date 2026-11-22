@@ -379,6 +379,17 @@ type Params struct {
 	// fires when on target; otherwise we break its line with coverMove (boost, no new laser charge so we keep
 	// full speed), unless we are finishing a target. 0 = off.
 	ChargeEngage float64
+	// EarlySpace [earlyspace]: ALL MODES, only before 20 s (identical in practice and FFA). Loot utility adds
+	// EarlySpace x (mechs seen in the last 5 s within 85 m of the item + closeness of the nearest, 0 beyond 120 m)
+	// as extra metres of distance (the sole wanted weapon pickup within 90 m is exempt); home spots add the same
+	// cost and are re-chosen every 3 s instead of 12 s. 0 = off.
+	EarlySpace float64
+	// EarlySpaceR [earlyspacer]: earlyspace's closeness range in m (no cost from the nearest mech beyond it); 0 -> 120.
+	EarlySpaceR float64
+	// EarlySpaceKeep [earlyspacekeep]: with earlyspace on, before 20 s, once armed (laser or lightning held) and with
+	// no foe, walk directly away from the nearest mech seen in the last 5 s while it is closer than this (m);
+	// 0 -> 150 (real showdowns: top finishers keep the nearest mech ~145 m vs ~110 m). Negative = rule off.
+	EarlySpaceKeep float64
 	// LaserLOS [laserlos]: FFA-only (ffaOn). Real showdown data: team-bot lasers hit 0.93-0.97 whatever the target
 	// does, but 24% of laser shots hit cover first. So dodge drops giddy's sidestep against a laser charger aimed at
 	// us, and while a mech is (or may still be) holding a charge aimed at us we break its line with coverMove if the
@@ -1246,6 +1257,8 @@ func (b *Brain) step(o *Obs, act *Action) {
 		// chargeengage: no hot laser on the long-range charger, so break its line (coverMove) instead of fighting.
 		boost = me.Energy > 20 && (mx != 0 || my != 0)
 		mode = "chargecover"
+	case b.P.EarlySpace > 0 && now < b.earlySpaceT() && foe == nil && (laser != nil || light != nil) && b.earlyKeep(me, &mx, &my):
+		mode = "earlyspace" // walk away from the nearest recently seen mech until it is EarlySpaceKeep m away
 	case foe != nil:
 
 		ready := gun != nil && gun.Ammo > 0 && gun.Reload <= 0.25 && foe.Dist <= gun.Stats.Range-10
@@ -2232,6 +2245,22 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 	var best *lootChoice
 	bestU := 0.0
 	econ := b.P.Econ
+	// earlyspace: before EarlySpaceT, loot costs extra "metres" for nearby mechs; a weapon pickup that is the only
+	// wanted one within 90 m is exempt (never block arming).
+	esOn := b.P.EarlySpace > 0 && now < b.earlySpaceT()
+	soleWeapon := -1
+	if esOn {
+		n := 0
+		for _, p := range b.pickups {
+			if b.wantPickup(me, p.Kind) && hyp(p.Pos[0]-x, p.Pos[1]-y) < 90 {
+				n++
+				soleWeapon = p.ID
+			}
+		}
+		if n != 1 {
+			soleWeapon = -1
+		}
+	}
 	consider := func(kind string, id int, pos Vec3, value float64) {
 		if until, ok := b.bad[id]; ok && until > now {
 			return
@@ -2254,12 +2283,16 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 		if nf := b.W.NearestFree(b.W.Cell(pos[0], pos[1])); nf < 0 || b.W.Comp[nf] != b.W.MainComp {
 			return
 		}
-		u := value / (d + 18)
+		es := 0.0
+		if esOn && !(kind == "pickup" && id == soleWeapon) {
+			es = b.earlySpaceCost(pos[0], pos[1])
+		}
+		u := value / (d + 18 + es)
 		if id == b.lootID {
 			u *= 1.35
 		}
 		if econ {
-			u = value - 0.6*d
+			u = value - 0.6*(d+es)
 			if id == b.lootID {
 				u += 30
 			}
@@ -2697,6 +2730,9 @@ func (b *Brain) homeCost(o *Obs, px, py float64) float64 {
 	if b.ffaNow && b.P.HomeLOS > 0 {
 		c += b.homeLOSCost(o, px, py) // homelos
 	}
+	if b.P.EarlySpace > 0 && b.now < b.earlySpaceT() {
+		c += b.earlySpaceCost(px, py) // earlyspace (all modes, first 20 s)
+	}
 	return c
 }
 
@@ -2765,6 +2801,70 @@ func (b *Brain) homeSeen(o *Obs) bool {
 	return gained
 }
 
+// earlySpaceT (earlyspace) is the end of the early window: giddy's practice/squad switch time (20 s).
+func (b *Brain) earlySpaceT() float64 {
+	return 20
+}
+
+// earlySpaceCost (earlyspace) is EarlySpace x (mechs seen in the last 5 s within 85 m of the spot + closeness of
+// the nearest such mech, (120 - min(d, 120)) / 120). Real showdowns: at 20 s, distance to the nearest mech goes
+// with points (rho +0.24) and enemies in LOS within 85 m against them (rho -0.22) (Data/Winner autopsies.md).
+func (b *Brain) earlySpaceCost(px, py float64) float64 {
+	n, near := 0.0, math.Inf(1)
+	for _, t := range b.tracks {
+		if b.now-t.Seen > 5 {
+			continue
+		}
+		d := hyp(t.Pos[0]-px, t.Pos[1]-py)
+		if d < 85 {
+			n++
+		}
+		near = math.Min(near, d)
+	}
+	if math.IsInf(near, 1) {
+		return 0
+	}
+	r := 120.0
+	if b.P.EarlySpaceR > 0 {
+		r = b.P.EarlySpaceR
+	}
+	return b.P.EarlySpace * (n + (r-math.Min(near, r))/r)
+}
+
+// earlyKeep (earlyspace) sets a walk directly away from the nearest mech seen in the last 5 s when it is closer
+// than EarlySpaceKeep (default 150 m); false when no such mech or the rule is off.
+func (b *Brain) earlyKeep(me *Self, mx, my *float64) bool {
+	keep := 150.0
+	if b.P.EarlySpaceKeep < 0 {
+		return false
+	}
+	if b.P.EarlySpaceKeep > 0 {
+		keep = b.P.EarlySpaceKeep
+	}
+	x, y := me.Pos[0], me.Pos[1]
+	var near *Track
+	nd := keep
+	for _, t := range b.tracks {
+		if b.now-t.Seen > 5 {
+			continue
+		}
+		if d := hyp(t.Pos[0]-x, t.Pos[1]-y); d < nd {
+			near, nd = t, d
+		}
+	}
+	if near == nil {
+		return false
+	}
+	ax, ay := x-near.Pos[0], y-near.Pos[1]
+	l := hyp(ax, ay) + 1e-9
+	gx, gy := x+ax/l*30, y+ay/l*30
+	if !b.W.InBounds(gx, gy) {
+		return false
+	}
+	*mx, *my = b.travel(me, gx, gy)
+	return *mx != 0 || *my != 0
+}
+
 func (b *Brain) home(o *Obs) (float64, float64, bool) {
 	z := &o.Zone
 	force := b.homeSeen(o) // homelos: a fresh sightline onto home re-chooses at once (false when off)
@@ -2772,7 +2872,11 @@ func (b *Brain) home(o *Obs) (float64, float64, bool) {
 		return b.holdHome(o, force)
 	}
 	out := !b.homeSet || hyp(b.homeXY[0]-z.NextCenter[0], b.homeXY[1]-z.NextCenter[1]) > z.NextRadius*0.8
-	if out || b.now-b.homeAt > 12 || force {
+	rechoose := 12.0
+	if b.P.EarlySpace > 0 && b.now < b.earlySpaceT() {
+		rechoose = 3 // earlyspace
+	}
+	if out || b.now-b.homeAt > rechoose || force {
 		b.homeAt = b.now
 		best, bestC := [2]float64{}, math.Inf(1)
 		for k := 0; k < 40; k++ {
@@ -3524,6 +3628,12 @@ func applyFlags(p *Params, spec string) {
 			p.HomeLOS = f
 		case "chargeengage":
 			p.ChargeEngage = f
+		case "earlyspace":
+			p.EarlySpace = f
+		case "earlyspacer":
+			p.EarlySpaceR = f
+		case "earlyspacekeep":
+			p.EarlySpaceKeep = f
 		case "laserlos":
 			p.LaserLOS = f
 		case "rearavoid":
@@ -3656,6 +3766,7 @@ func (b *Brain) safeFallback() {
 		p.LateR, p.HoldOut = 70, 0
 		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
+		p.EarlySpace, p.EarlySpaceR, p.EarlySpaceKeep = 0, 0, 0
 		p.RearAvoid, p.CoverReload = 0, false
 		p.FFADrops, p.CubeStop, p.EarlyRetreat = 0, false, 0
 		p.LaserLOS = 0
