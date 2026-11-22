@@ -259,6 +259,11 @@ type Params struct {
 	// fires falsely in ~1 of 48 practice matches (a house bot dying to the zone or a drone); 2 keeps practice play
 	// identical while real FFAs reach 2 such deaths a few seconds later.
 	FFAStrictN float64
+	// SqUseDrops [squsedrops] / SqHPw [sqhpw]: practice-mode (squad params) only. Capture supply drops against the
+	// house squad (team recursive: giddy + drops = 6.16 on builders-4), and the squad target HP weight (giddy
+	// 0.18; IT_Professionals 0.21). FFA play is unchanged except in the squad window before the first death.
+	SqUseDrops bool
+	SqHPw      float64
 	// CrowdR [crowdr] / HomeFrac [homefrac]: FFA-only spacing. Crowd penalty radius in homeCost (giddy 80 m) and
 	// how far out of the next circle home spots are sampled (giddy 0.7 of its radius). 0 = giddy.
 	CrowdR   float64
@@ -2767,6 +2772,12 @@ func squadParams(p Params) Params {
 	p.LethalK = 0.7
 	p.HPw = 0.15
 	p.HPw = 0.18
+	if p.SqHPw > 0 {
+		p.HPw = p.SqHPw
+	}
+	if p.SqUseDrops {
+		p.UseDrops = true
+	}
 
 	if p.SqLaserRange > 0 {
 		p.LaserRange = p.SqLaserRange
@@ -2995,6 +3006,10 @@ func applyFlags(p *Params, spec string) {
 			p.CfgFFA = on
 		case "cfggate":
 			p.CfgGate = on
+		case "squsedrops":
+			p.SqUseDrops = on
+		case "sqhpw":
+			p.SqHPw = f
 		case "ffastrictn":
 			p.FFAStrictN = f
 		case "ffastrict":
