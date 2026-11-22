@@ -126,6 +126,9 @@ type Brain struct {
 	// peekcd (bit 2): id of the hidden foe whose laser we heard fire, and when its cooldown ends.
 	cdID    int
 	cdUntil float64
+	// laserlos: when each mech was first seen charging a laser aimed at us (this charge); entries are dropped when it
+	// stops charging, aims away, fires (beam seen) or the charge must have auto-released.
+	lzSince map[int]float64
 	// regenhide: latched while regenerating in cover, and when the latch started.
 	regenOn bool
 	regenAt float64
@@ -340,6 +343,11 @@ type Params struct {
 	// fires when on target; otherwise we break its line with coverMove (boost, no new laser charge so we keep
 	// full speed), unless we are finishing a target. 0 = off.
 	ChargeEngage float64
+	// LaserLOS [laserlos]: FFA-only (ffaOn). Real showdown data: team-bot lasers hit 0.93-0.97 whatever the target
+	// does, but 24% of laser shots hit cover first. So dodge drops giddy's sidestep against a laser charger aimed at
+	// us, and while a mech is (or may still be) holding a charge aimed at us we break its line with coverMove if the
+	// cover spot is within this many metres, holding it until the charge resolves. 0 = off. (Port of lab/laserlos.)
+	LaserLOS float64
 	// FFADrops [ffadrops]: FFA-only (ffaOn). Conditional supply-drop capture through giddy's dormant drop path (the
 	// UseDrops branches of chooseLoot, same values and the same "reachable before landing + 25 s" test). The value
 	// is the farthest drop we go for, in m (0 = off). Only the first two drops of the match (called at 70 and
@@ -964,6 +972,18 @@ func (b *Brain) step(o *Obs, act *Action) {
 	}
 
 	finishing := target != nil && target.Dist < 120 && (target.HP < 200 || target.HP < me.HP*0.5)
+	// laserlos: mechs holding (or maybe still holding, out of sight) a laser charge aimed at us; lzHot = our own laser
+	// is hot on one of them with a clear line, so the fight branch shoots instead of hiding.
+	var lzThreats []*Track
+	lzHot := false
+	if b.P.LaserLOS > 0 && ffaOn {
+		lzThreats = b.laserThreats(o)
+		for _, t := range lzThreats {
+			if t.Seen == now && t.LOS && laser != nil && laser.Charge >= laser.Stats.Charge-0.3 && t.Dist <= laser.Stats.Range-5 {
+				lzHot = true
+			}
+		}
+	}
 	_, myLaser := hasWeapon(me.Weapons, "laser")
 	outgunned := target != nil && holds(target.Weapons, "laser") && myLaser == nil && target.Dist > 55 && hpFrac < 0.8
 	if b.P.GunOnlyOut && ffaOn && gun != nil && light == nil && laser == nil {
@@ -1110,6 +1130,10 @@ func (b *Brain) step(o *Obs, act *Action) {
 		b.coverMove(o, seen, &mx, &my):
 		boost = me.Energy > 30 && (mx != 0 || my != 0)
 		mode = "evade"
+	case len(lzThreats) > 0 && !lzHot && !finishing && b.laserCover(o, lzThreats, &mx, &my):
+		// laserlos: break (and hold) the line of every laser charge aimed at us when cover is close enough.
+		boost = me.Energy > 20 && (mx != 0 || my != 0)
+		mode = "lasercover"
 	case chargeFoe != nil && !finishing && !(chargeFoe.LOS && laser != nil && laser.Charge >= laser.Stats.Charge-0.3 &&
 		chargeFoe.Dist <= laser.Stats.Range-5) && b.coverMove(o, seen, &mx, &my):
 		// chargeengage: no hot laser on the long-range charger, so break its line (coverMove) instead of fighting.
@@ -1490,7 +1514,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 			}
 		}
 	}
-	if mode == "chargecover" {
+	if mode == "chargecover" || mode == "lasercover" {
 		for i, w := range me.Weapons {
 			if w != nil && i < 2 && w.Kind == "laser" && w.Charge <= 0 {
 				act.Fire[i] = false // chargeengage: no new charge (half speed) while breaking its line
@@ -2550,6 +2574,9 @@ func (b *Brain) dodge(o *Obs) (dx, dy float64, laser bool) {
 		if m.Kind != "mech" || !m.Charging {
 			continue
 		}
+		if b.P.LaserLOS > 0 && b.ffaNow {
+			break // laserlos: a sidestep does not beat a laser (real data); the cover move must not be outweighed
+		}
 		toMe := math.Atan2(cy-m.Pos[1], cx-m.Pos[0])
 		if math.Abs(angDiff(m.Aim[0], toMe)) > 0.15 {
 			continue
@@ -2562,6 +2589,75 @@ func (b *Brain) dodge(o *Obs) (dx, dy float64, laser bool) {
 		return dx / l, dy / l, laser
 	}
 	return 0, 0, false
+}
+
+// laserThreats (laserlos) updates b.lzSince and returns, sorted by id, the mechs that are, or out of sight may still
+// be, holding a laser charge aimed at us: seen charging with their aim within 0.15 rad of us within laser range +
+// 10 m. An entry ends when the mech is seen not charging, aiming more than 0.5 rad away or beyond that range, when
+// one of its laser beams is seen, or charge + hold_s + 0.3 s after we first saw this charge (it must have fired).
+func (b *Brain) laserThreats(o *Obs) []*Track {
+	if b.lzSince == nil {
+		b.lzSince = map[int]float64{}
+	}
+	me := &o.Self
+	x, y := me.Pos[0], me.Pos[1]
+	ls := b.Cfg.Weapons["laser"]
+	life := ls.Charge + ls.HoldS + 0.3
+	if life < 1 {
+		life = 3.05
+	}
+	rng := ls.Range + 10
+	if ls.Range <= 0 {
+		rng = 290
+	}
+	fired := map[int]bool{}
+	for _, bm := range o.Beams {
+		if bm.Kind == "laser" {
+			fired[bm.By] = true
+		}
+	}
+	for id, since := range b.lzSince {
+		if b.tracks[id] == nil || fired[id] || b.now-since > life {
+			delete(b.lzSince, id)
+		}
+	}
+	var out []*Track
+	for id, t := range b.tracks {
+		if t.Kind != "mech" {
+			continue
+		}
+		if t.Seen == b.now {
+			off := math.Abs(angDiff(t.Aim[0], math.Atan2(y-t.Pos[1], x-t.Pos[0])))
+			if !t.Charging || off > 0.5 || hyp(t.Pos[0]-x, t.Pos[1]-y) > rng || fired[id] {
+				delete(b.lzSince, id)
+				continue
+			}
+			if _, ok := b.lzSince[id]; !ok && off < 0.15 {
+				b.lzSince[id] = b.now
+			}
+		}
+		if _, ok := b.lzSince[id]; ok {
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// laserCover (laserlos) runs coverMove against the laser threats and accepts it only if the hidden spot is within
+// LaserLOS m (otherwise the charge lands before we get there and the move only costs position).
+func (b *Brain) laserCover(o *Obs, threats []*Track, mx, my *float64) bool {
+	ox, oy := *mx, *my
+	if !b.coverMove(o, threats, mx, my) {
+		return false
+	}
+	me := &o.Self
+	if hyp(b.coverGoal[0]-me.Pos[0], b.coverGoal[1]-me.Pos[1]) > b.P.LaserLOS {
+		*mx, *my = ox, oy
+		b.coverOK = false
+		return false
+	}
+	return true
 }
 
 func (b *Brain) reach(me *Self) float64 {
@@ -2791,6 +2887,7 @@ func squadParams(p Params) Params {
 	p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 	p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
 	p.FFADrops, p.CubeStop, p.EarlyRetreat = 0, false, 0
+	p.LaserLOS = 0
 	p.LateR = 70
 	p.HoldOut = 0
 	p.LateAlive = 3
@@ -3040,6 +3137,8 @@ func applyFlags(p *Params, spec string) {
 			p.HomeLOS = f
 		case "chargeengage":
 			p.ChargeEngage = f
+		case "laserlos":
+			p.LaserLOS = f
 		case "ffadrops":
 			p.FFADrops = f
 		case "cubestop":
@@ -3157,6 +3256,7 @@ func (b *Brain) safeFallback() {
 		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
 		p.FFADrops, p.CubeStop, p.EarlyRetreat = 0, false, 0
+		p.LaserLOS = 0
 	}
 	off(&b.base)
 	b.regenOn = false
