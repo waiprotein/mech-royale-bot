@@ -14,7 +14,7 @@ The protocol itself comes from the organiser's `mechfight-kit` (`protocol.md`).
 
 ## Our original work (on top of giddy's base)
 
-In numbers (Sun 22 Nov, 12:40 GMT): `mech/brain.go` is **4,558 lines, of which about 2,600 are ours** (giddy's file had 2,001; we removed 38 of its lines). It has **95 top-level functions, 54 of them new** (giddy's had 41). On top of that we wrote **29 unit-test files (~3,000 lines; giddy ships no tests)**, the WebAssembly test build (`cmd/wasmbot`) and an RNG salt (`mech/salt.go`), over 70 commits after the import. `mech/world.go` (map, line of sight, pathing) and `mech/types.go` are giddy's, essentially unchanged. About 40% of the shipped Go code is ours.
+In numbers (Sun 22 Nov, 12:40 GMT), measured with `diff -w -B` of our `mech/` files against giddy's upstream `e19e3c8` (the MIT copy in charliescull/mech-royale-bot `drivers/giddy/`) and by comparing top-level function names: `mech/brain.go` is **4,558 lines; we added 2,595 of them (2,067 code, 528 comments) and removed 38 of giddy's 2,001**. It has **95 top-level functions, 54 of them new** (giddy's 41 are all still there). `mech/types.go` gained 9 lines (beam events); `mech/world.go` (map, line of sight, pathing) is giddy's, unchanged. Of the 6,583 shipped Go lines, about 2,610 (≈ 40%) are ours. On top of that we wrote **29 unit-test files (3,029 lines; giddy ships no tests)**, the WebAssembly test build (`cmd/wasmbot`) and an RNG salt (`mech/salt.go`), over 70 commits after the import.
 
 Every addition below is our own code, behind a parameter in `Params` (documented next to each field), and the submitted build sets its parameters in `DefaultParams()`. All in `mech/brain.go`; see the git history for every step.
 
