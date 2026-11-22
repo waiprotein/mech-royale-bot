@@ -12,18 +12,18 @@ This bot is based on **giddygiddyboy's public Mech Royale bot**, used under its 
 
 The protocol itself comes from the organiser's `mechfight-kit` (`protocol.md`).
 
-## What we changed (our own work, on top of giddy's base)
+## Our original work (on top of giddy's base)
 
-In numbers (Sun 22 Nov): about **1,000 of the 2,983 lines in `mech/brain.go` are ours** (giddy's base file had ~2,000), plus ~460 lines of our tests and test tooling (`mech/*_test.go`, `cmd/wasmbot`), over 38 commits after the import. `mech/world.go` (map, line of sight, paths) and `mech/types.go` are giddy's, essentially unchanged. In the final our free-for-all logic below takes over after the bot has proven it is in a free-for-all; in practice matches against the house squad it deliberately plays like giddy's base.
+In numbers (Sun 22 Nov, 12:40 GMT): `mech/brain.go` is **4,558 lines, of which about 2,600 are ours** (giddy's file had 2,001; we removed 38 of its lines). It has **95 top-level functions, 54 of them new** (giddy's had 41). On top of that we wrote **29 unit-test files (~3,000 lines; giddy ships no tests)**, the WebAssembly test build (`cmd/wasmbot`) and an RNG salt (`mech/salt.go`), over 70 commits after the import. `mech/world.go` (map, line of sight, pathing) and `mech/types.go` are giddy's, essentially unchanged. About 40% of the shipped Go code is ours.
 
-All in `mech/brain.go` unless noted; see the git history for every step.
+Every addition below is our own code, behind a parameter in `Params` (documented next to each field), and the submitted build sets its parameters in `DefaultParams()`. All in `mech/brain.go`; see the git history for every step.
 
-- **Free-for-all detection and strict gating (`FFAStrict`).** Our FFA behaviours switch on only after the bot has proven it is in a free-for-all (a death it did not cause), so they never act against the practice house squad.
-- **End game:** retreat stays allowed until the next circle is 25 m (`LateR`), and the bot holds a hidden spot away from the final-centre pile-up until the zone forces it in (`HoldOut`, `HoldMin`, `holdHome`).
-- **Duel model (`duelOdds`, `DuelFlee`):** fight-or-flee decisions from a logistic model we fitted on recorded top-16 showdown engagements (first shot, HP ratio, lasers, facing).
-- **Weapon and engagement rules:** gun-only versus an armed mech counts as outgunned (`GunOnlyOut`); lightning-only breaks line of sight from laser holders beyond lightning range (`LightLOS`); facing unexplained weapon sounds (`FaceSound`); third-party joins from farther than the target's current opponent (`TPJoin`); rear-arc openers (`BackOpen`); long-range laser openers on unaware or busy mechs with less HP, fought from long range (`LRLaser`, `LRHP`, `LRKeep`); laser pre-charge discipline (`PreCharge`, `PeekCD`); spacing (`CrowdR`, `HomeFrac`); the alive-count part of giddy's no-retreat end game (`LateAlive`).
-- **Experiment plumbing:** `MECH_FLAGS` parameter overrides for local tests (unset in matches), a `Salt` for RNG re-rolls, a beam-based FFA detector (`BeamFFA`, off), and a WebAssembly test build (`cmd/wasmbot`, not part of the image).
-- Which of these are switched on in the submitted build is set in `DefaultParams()`.
+- **Free-for-all detection and strict gating (`FFAStrict`, `FFAStrictN`).** Our FFA behaviours switch on only after the bot has proven it is in a free-for-all (one or two deaths it did not cause), so the practice house squad sees a different policy from the FFA.
+- **Our FFA brain (validated in our own 16-mech simulations, both against giddy-majority fields and against fields with rival bots):** gun-only vs armed foes counts as outgunned (`GunOnlyOut`, `GunOnlyR`); lightning-only breaks line of sight from laser holders (`LightLOS`); long-range laser openers on mechs that are unaware or busy, fought from range (`LRLaser`, `LRHP`, `LRKeep`); hide-and-regenerate latch (`RegenHide`); home spots out of sight of fresh mechs (`HomeLOS`); watching the last foe when idle (`WatchLast`); breaking the line of a laser charge aimed at us (`LaserLOS`, `laserThreats`, `laserCover`); end-game retreat and hold-out away from the final pile-up (`LateR`, `HoldOut`, `HoldMin`, `holdHome`); a fight-or-flee duel model fitted on recorded showdown engagements (`duelOdds`, exchange tracker).
+- **Opening:** arm early with a second weapon (`Arm`, `ArmFirst`, `ArmBoost`, `Scan`, `ArmStrict`, `ArmUntil`), and a calm 360° rescan (`Rescan`).
+- **Practice-mode (house-squad) play:** squad laser range (`SqLaserRange`), late cautious play (`CautiousT`), rim holding (`PracRim`, `SqRim`), back-turned openers and squad long-range laser (`SqBackOpen`, `SqLRLaser`), regen-window target lock (`RegenLock`), close hunting (`SqHunt`), squad retreat/return and turning on a lone chaser (`SqRet`, `SqRetUp`, `SqCorner`), practice / pre-latch engage radius (`PEngage`), and more levers (rear-arc avoidance, cover while reloading, laser-cooldown punish, lightning stand-off, kill-aware fire control, kiting, cornered cover, speed/dodge, drop capture).
+- **Safety:** a crash breaker (`safeFallback`): after 3 recovered panics in a match every one of our additions switches off and the bot plays plain giddy; the first panics are logged to stderr.
+- **Tooling (in this repo):** `MECH_FLAGS` parameter overrides for local tests (unset in matches), `cmd/wasmbot` for our local simulator, and the unit tests in `mech/*_test.go`. Our simulator, league runner and analysis tools live in a separate private lab repo.
 
 ## Layout
 
