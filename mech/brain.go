@@ -597,6 +597,25 @@ func DefaultParams() Params {
 	// at the final centre is skipped until the zone forces the bot in.
 	p.PracAt = 20
 	p.FFAStrict = true
+	// Build q4: C1 FFA brain + laserlos, levers QCM FFA laserlos=0;arm=1;scan=1.6;armfirst=1;rescan=1. Flags: ffastrictn=2,gunonlyout=1,gunonlyr=130,lrlaser=180,lrkeep=110,lrhp=1.0,lightlos=1,regenhide=0.6,homelos=60,watchlast=8,laserlos=0,sqlaser=150,cautioust=265,pracrim=0.88,arm=1,scan=1.6,armfirst=1,rescan=1
+	p.FFAStrictN = 2
+	p.GunOnlyOut = true
+	p.GunOnlyR = 130
+	p.LRLaser = 180
+	p.LRKeep = 110
+	p.LRHP = 1.0
+	p.LightLOS = true
+	p.RegenHide = 0.6
+	p.HomeLOS = 60
+	p.WatchLast = 8
+	p.LaserLOS = 0
+	p.SqLaserRange = 150
+	p.CautiousT = 265
+	p.PracRim = 0.88
+	p.Arm = true
+	p.Scan = 1.6
+	p.ArmFirst = true
+	p.Rescan = true
 	p.BeamFFA = false // practice-safe (S5 = 6.19) but -0.28 in the FFA sim (round 9); kept as a flag
 	p.LateR = 25
 	p.HoldOut = 368
