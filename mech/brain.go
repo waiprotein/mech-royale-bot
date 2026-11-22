@@ -408,6 +408,12 @@ type Params struct {
 	// laser at full charge, or a short gun burst (<= 1 s, in ammo, within 60 m), kills it at that safety factor.
 	// The value is the safety factor (suggested 0.92: one unseen armour stack); 0 = off.
 	SmartFire float64
+	// CautiousT [cautioust]: PRACTICE-side. From match time CautiousT s, or once the next zone circle is <= 72 m,
+	// squad (practice hunt) params switch off for the rest of the match and giddy's own cautious ghost play takes
+	// over (engage within EngageDist or when attacked, home spots in cover, our end-game hold-out). It acts only
+	// while practice params would be on, so after a proven FFA (squad params already off) it changes nothing.
+	// 0 = off (suggested 265: Apex-Go's late-cautious switch; "+0.35 official" credited to Th3r0n's version).
+	CautiousT float64
 }
 
 func DefaultParams() Params {
@@ -649,7 +655,9 @@ func (b *Brain) observe(o *Obs) {
 		pracAt = b.base.PracAt
 	}
 	noSquad := b.base.CfgGate && b.base.CfgNoSquad && b.showCfg
-	if on := b.base.Practice && !noSquad && !b.notPractice && now > pracAt; on != b.pracOn {
+	// cautioust: late practice play hands over from the squad hunt to giddy's cautious ghost play.
+	cautious := b.base.CautiousT > 0 && (now >= b.base.CautiousT || (o.Zone.NextRadius > 0 && o.Zone.NextRadius <= 72))
+	if on := b.base.Practice && !noSquad && !b.notPractice && now > pracAt && !cautious; on != b.pracOn {
 		b.pracOn = on
 		b.P = b.base
 		if on {
@@ -3377,6 +3385,8 @@ func applyFlags(p *Params, spec string) {
 			p.LightPad = f
 		case "smartfire":
 			p.SmartFire = f
+		case "cautioust":
+			p.CautiousT = f
 		}
 	}
 }
@@ -3489,6 +3499,7 @@ func (b *Brain) safeFallback() {
 		p.FFADrops, p.CubeStop, p.EarlyRetreat = 0, false, 0
 		p.LaserLOS = 0
 		p.LCDPunish, p.LightPad, p.SmartFire = 0, 0, 0
+		p.CautiousT = 0
 	}
 	off(&b.base)
 	b.regenOn = false
