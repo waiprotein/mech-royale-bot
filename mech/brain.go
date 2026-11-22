@@ -414,6 +414,12 @@ type Params struct {
 	// while practice params would be on, so after a proven FFA (squad params already off) it changes nothing.
 	// 0 = off (suggested 265: Apex-Go's late-cautious switch; "+0.35 official" credited to Th3r0n's version).
 	CautiousT float64
+	// PracRim [pracrim]: PRACTICE-side (only while !ffaOn, under squad params). With no target, loot or zone move,
+	// giddy's squad play stands still. While the next zone circle is >= 180 m, walk instead to the rim spot at
+	// PracRim x its radius from its centre, on our side, and hold there: the house squad converges on the
+	// middle, the rim keeps one side open and the zone at our back predictable. 0 = off (suggested 0.88; idea from
+	// Apex-Go PracticeRim, 88% rim while r >= 180, +0.16 in its practice stack, and 4141's 0.9 rim play).
+	PracRim float64
 }
 
 func DefaultParams() Params {
@@ -1326,6 +1332,12 @@ func (b *Brain) step(o *Obs, act *Action) {
 		} else if zdist > 3 && (!b.P.Ghost || (z.NextRadius <= 30 && !b.holdingOut(z, o.Alive))) {
 			mx, my = b.travel(me, zgx, zgy)
 			mode = "zone-walk"
+		} else if b.P.PracRim > 0 && !ffaOn && !b.P.Ghost && z.NextRadius >= 180 {
+			// pracrim: idle squad play holds the rim of the next circle instead of standing still.
+			if rx, ry := b.rimSpot(z, x, y); hyp(rx-x, ry-y) > 6 {
+				mx, my = b.travel(me, rx, ry)
+				mode = "rim"
+			}
 		} else if b.P.Ghost {
 
 			if hx, hy, ok := b.home(o); ok && hyp(hx-x, hy-y) > 3 {
@@ -2520,6 +2532,18 @@ func (b *Brain) canKill(me *Self, t *Track, gun, laser *WeaponState, x, y float6
 	return false
 }
 
+// rimSpot (pracrim) is the point PracRim x NextRadius from the next circle's centre in our direction (east if we
+// stand on the centre).
+func (b *Brain) rimSpot(z *Zone, x, y float64) (float64, float64) {
+	dx, dy := x-z.NextCenter[0], y-z.NextCenter[1]
+	d := hyp(dx, dy)
+	if d < 1 {
+		dx, dy, d = 1, 0, 1
+	}
+	r := b.P.PracRim * z.NextRadius
+	return z.NextCenter[0] + dx/d*r, z.NextCenter[1] + dy/d*r
+}
+
 // lightReach (lightpad) is the distance we keep from lightning holders: weapons.lightning.range (45 m if
 // missing) plus LightPad.
 func (b *Brain) lightReach() float64 {
@@ -3387,6 +3411,8 @@ func applyFlags(p *Params, spec string) {
 			p.SmartFire = f
 		case "cautioust":
 			p.CautiousT = f
+		case "pracrim":
+			p.PracRim = f
 		}
 	}
 }
@@ -3499,7 +3525,7 @@ func (b *Brain) safeFallback() {
 		p.FFADrops, p.CubeStop, p.EarlyRetreat = 0, false, 0
 		p.LaserLOS = 0
 		p.LCDPunish, p.LightPad, p.SmartFire = 0, 0, 0
-		p.CautiousT = 0
+		p.CautiousT, p.PracRim = 0, 0
 	}
 	off(&b.base)
 	b.regenOn = false
