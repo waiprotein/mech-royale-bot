@@ -154,6 +154,8 @@ type Brain struct {
 	// sqret: squad-mode HP retreat latch. finMove (sqband): set while fightMove runs for the finish rule.
 	sqRetOn bool
 	finMove bool
+	// sqcorner: when the current sqret latch started.
+	sqRetAt float64
 }
 
 type Params struct {
@@ -552,6 +554,14 @@ type Params struct {
 	// overwrites the retreat flag every tick. SqRet adds a latch on top of LoseRule: below SqRet with a threat
 	// in the last 2 s we retreat until RecoverHP (0.8), or 7 s with no threat above 55%. 0 = off (squadrim: 0.30).
 	SqRet float64
+	// SqRetUp [sqretup]: with SqRet on, the HP share at which the squad-mode retreat ends (instead of RecoverHP,
+	// 0.8). Apex-Go's practice stance retreats at 20% and returns at 65%: back in the fight sooner, more kills.
+	// 0 = use RecoverHP.
+	SqRetUp float64
+	// SqCorner [sqcorner]: with SqRet on, after more than 2 s of squad-mode retreat, if exactly one mech seen this
+	// tick has line of sight to us within 45 m (a lone chaser) and our odds against it are above 0.35, stop
+	// retreating for this tick and fight it (running from a lone close chaser just gives it free hits). false = off.
+	SqCorner bool
 	// SqSpeed [sqspeed] / SqDodge [sqdodge]: PRACTICE-side, act only while !ffaOn (practice squad play AND the
 	// pre-latch window, including the FFA final before the latch; after it, giddy's ffaOn-gated SpeedUp/DodgeBoost
 	// flags apply as before). House guns deal most of their damage inside 100 m, so speed and evasive boosts should
@@ -1320,15 +1330,34 @@ func (b *Brain) step(o *Obs, act *Action) {
 	if b.P.SqRet > 0 && b.pracOn {
 		if !b.sqRetOn && hpFrac < b.P.SqRet && now-b.lastThreatAt < 2 {
 			b.sqRetOn = true
+			b.sqRetAt = now
 			if !b.retreat {
 				b.coverAt = -1
 			}
 		}
-		if b.sqRetOn && (hpFrac > b.P.RecoverHP || (now-b.lastThreatAt > 7 && hpFrac > 0.55)) {
+		recover := b.P.RecoverHP
+		if b.P.SqRetUp > 0 {
+			recover = b.P.SqRetUp // sqretup: return to the fight earlier than RecoverHP
+		}
+		if b.sqRetOn && (hpFrac > recover || (now-b.lastThreatAt > 7 && hpFrac > math.Min(0.55, recover))) {
 			b.sqRetOn = false
 		}
 		if b.sqRetOn {
 			b.retreat = true
+			if b.P.SqCorner && now-b.sqRetAt > 2 {
+				// sqcorner: turn on a lone close chaser instead of running from it.
+				var lone *Track
+				n := 0
+				for _, t := range seen {
+					if t.Kind == "mech" && t.Seen == now && t.LOS && t.Dist < 45 {
+						n++
+						lone = t
+					}
+				}
+				if n == 1 && b.odds(me, lone, now, false) > 0.35 {
+					b.retreat = false
+				}
+			}
 		}
 	} else {
 		b.sqRetOn = false
@@ -4200,6 +4229,10 @@ func applyFlags(p *Params, spec string) {
 			p.SqBand = on
 		case "sqret":
 			p.SqRet = f
+		case "sqretup":
+			p.SqRetUp = f
+		case "sqcorner":
+			p.SqCorner = on
 		case "kiteboost":
 			p.KiteBoost = f
 		case "kitew":
@@ -4325,6 +4358,7 @@ func (b *Brain) safeFallback() {
 		p.CautiousT, p.PracRim = 0, 0
 		p.Arm, p.Scan, p.CubePush, p.ArmFirst = false, 0, 0, false
 		p.SqRim, p.SqLootIn, p.SqBand, p.SqRet = 0, 0, false, 0
+		p.SqRetUp, p.SqCorner = 0, false
 		p.SqSpeed, p.SqDodge, p.SqEngage = false, 0, 0
 		p.ArmBoost, p.SqJink = false, false
 	}
