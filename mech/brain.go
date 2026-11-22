@@ -637,6 +637,32 @@ func DefaultParams() Params {
 	// at the final centre is skipped until the zone forces the bot in.
 	p.PracAt = 20
 	p.FFAStrict = true
+	// Build cc3: r3 practice play + cornercover=2 (laserlos 25) + ffastrictn=1. Flags: ffastrictn=1,gunonlyout=1,gunonlyr=130,lrlaser=180,lrkeep=110,lrhp=1.0,lightlos=1,regenhide=0.6,homelos=60,watchlast=8,laserlos=25,sqlaser=150,cautioust=265,pracrim=0.88,sqbackopen=1,sqlrlaser=180,hunthide=1,pracregen=0.6,kiteboost=30,kitew=2.5,lootradius=150,arm=1,scan=1.6,armfirst=1,cornercover=2
+	p.FFAStrictN = 1
+	p.GunOnlyOut = true
+	p.GunOnlyR = 130
+	p.LRLaser = 180
+	p.LRKeep = 110
+	p.LRHP = 1.0
+	p.LightLOS = true
+	p.RegenHide = 0.6
+	p.HomeLOS = 60
+	p.WatchLast = 8
+	p.LaserLOS = 25
+	p.SqLaserRange = 150
+	p.CautiousT = 265
+	p.PracRim = 0.88
+	p.SqBackOpen = true
+	p.SqLRLaser = 180
+	p.HuntHide = true
+	p.PracRegen = 0.6
+	p.KiteBoost = 30
+	p.KiteW = 2.5
+	p.LootRadius = 150
+	p.Arm = true
+	p.Scan = 1.6
+	p.ArmFirst = true
+	p.CornerCover = 2
 	p.BeamFFA = false // practice-safe (S5 = 6.19) but -0.28 in the FFA sim (round 9); kept as a flag
 	p.LateR = 25
 	p.HoldOut = 368
