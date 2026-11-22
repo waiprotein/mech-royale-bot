@@ -113,6 +113,7 @@ type Brain struct {
 	stickAt, loseAt    float64
 	myHitAt            map[int]float64
 	ffaNow             bool
+	maxUnexpl          int
 	dropOKAt           float64 // ffadrops: last time dropsOK passed our loot-target drop (commitment)
 	dropOrder          []int   // ffadrops: supply drop ids in the order they were first listed (= call order)
 	safeMode           bool
@@ -254,6 +255,10 @@ type Params struct {
 	// giddy's detector has proven a free-for-all (a death we did not cause). Practice play then stays identical to
 	// giddy e19e3c8 at salt 0 (6.19 on the board); other changes to practice play regress to ~5.5 (salt tests).
 	FFAStrict bool
+	// FFAStrictN [ffastrictn]: with FFAStrict, also require at least N deaths we did not cause (default 1). giddy's latch
+	// fires falsely in ~1 of 48 practice matches (a house bot dying to the zone or a drone); 2 keeps practice play
+	// identical while real FFAs reach 2 such deaths a few seconds later.
+	FFAStrictN float64
 	// CrowdR [crowdr] / HomeFrac [homefrac]: FFA-only spacing. Crowd penalty radius in homeCost (giddy 80 m) and
 	// how far out of the next circle home spots are sampled (giddy 0.7 of its radius). 0 = giddy.
 	CrowdR   float64
@@ -580,6 +585,9 @@ func (b *Brain) observe(o *Obs) {
 	if b.P.FFAMin > 1 {
 		ffaMin = int(b.P.FFAMin)
 	}
+	if u := b.startAlive - o.Alive - b.kills; u > b.maxUnexpl {
+		b.maxUnexpl = u
+	}
 	if b.startAlive-o.Alive-b.kills >= ffaMin {
 		b.otherDead++
 	} else {
@@ -762,7 +770,11 @@ func (b *Brain) step(o *Obs, act *Action) {
 	b.now = o.T
 	now := o.T
 	b.observe(o)
-	ffaOn := !b.pracOn && (!b.P.FFAStrict || b.notPractice || (b.P.CfgGate && b.P.CfgFFA && b.showCfg))
+	strictN := 1
+	if b.P.FFAStrictN > 1 {
+		strictN = int(b.P.FFAStrictN)
+	}
+	ffaOn := !b.pracOn && (!b.P.FFAStrict || (b.notPractice && (strictN <= 1 || b.maxUnexpl >= strictN)) || (b.P.CfgGate && b.P.CfgFFA && b.showCfg))
 	b.ffaNow = ffaOn
 	st := &me.Stats
 	x, y, zf := me.Pos[0], me.Pos[1], me.Pos[2]
@@ -2983,6 +2995,8 @@ func applyFlags(p *Params, spec string) {
 			p.CfgFFA = on
 		case "cfggate":
 			p.CfgGate = on
+		case "ffastrictn":
+			p.FFAStrictN = f
 		case "ffastrict":
 			p.FFAStrict = on
 		case "keeplaser":
