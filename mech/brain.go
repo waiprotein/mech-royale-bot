@@ -374,6 +374,13 @@ type Params struct {
 	// open on a laser holder: a fresh one (no hits either way for 6 s) that is not aiming at us, not below 350 HP
 	// and not in the end game is not engaged. 0 = off (suggested 1.5, a little under the cooldown).
 	LCDPunish float64
+	// LightPad [lightpad]: PRACTICE-side (only while !ffaOn). Lightning hits only within weapons.lightning.range
+	// (45 m) of its 30 degree cone, so stay farther than range + LightPad m from mechs holding it: the preferred
+	// fight range against a lightning holder is at least that (also when we hold lightning ourselves, and when
+	// finishing), so fightMove backs off (kites) when it closes; with a laser we fight it at our laser range.
+	// Candidate fight positions closer than that to any other seen lightning holder are penalised. 0 = off
+	// (suggested 12).
+	LightPad float64
 }
 
 func DefaultParams() Params {
@@ -1850,6 +1857,13 @@ func (b *Brain) prefRange(me *Self, t *Track) float64 {
 	if b.P.LCDPunish > 0 && !b.ffaNow && b.lcdWindow(t) && me.HP >= t.HP {
 		r = math.Min(r, 50) // lcdpunish: close in while its laser cools down
 	}
+	if b.P.LightPad > 0 && !b.ffaNow && t.Kind == "mech" && holds(t.Weapons, "lightning") {
+		// lightpad: never inside its lightning reach; with a laser, fight it at laser range (kite).
+		if laser != nil {
+			r = math.Max(r, b.P.LaserRange)
+		}
+		r = math.Max(r, b.lightReach())
+	}
 	return r
 }
 
@@ -1914,6 +1928,17 @@ func (b *Brain) fightMove(o *Obs, tg *Track, seen []*Track, wantLos float64) (fl
 			}
 		}
 		body := Vec3{cx, cy, cz + me.Stats.Height*0.6}
+		if b.P.LightPad > 0 && !b.ffaNow {
+			// lightpad: keep candidate spots out of other lightning holders' reach.
+			lr := b.lightReach()
+			for _, e := range seen {
+				if e != tg && e.Kind == "mech" && b.now-e.Seen < 2.5 && holds(e.Weapons, "lightning") {
+					if de := hyp(e.Pos[0]-cx, e.Pos[1]-cy); de < lr {
+						s -= 2 * (lr - de)
+					}
+				}
+			}
+		}
 		for _, e := range seen {
 			if e == tg || hyp(e.Pos[0]-cx, e.Pos[1]-cy) > 170 {
 				continue
@@ -2373,6 +2398,16 @@ func (b *Brain) lcdWindow(t *Track) bool {
 		w = math.Min(w, cd)
 	}
 	return b.now-t.LaserAt < w
+}
+
+// lightReach (lightpad) is the distance we keep from lightning holders: weapons.lightning.range (45 m if
+// missing) plus LightPad.
+func (b *Brain) lightReach() float64 {
+	lr := b.Cfg.Weapons["lightning"].Range
+	if lr <= 0 {
+		lr = 45
+	}
+	return lr + b.P.LightPad
 }
 
 // cubeSkip (cubestop) says whether to skip a detour to the cube or crate at pos: only when CubeStop is on, the
@@ -3117,6 +3152,8 @@ func applyFlags(p *Params, spec string) {
 			p.EarlyRetreat = f
 		case "lcdpunish":
 			p.LCDPunish = f
+		case "lightpad":
+			p.LightPad = f
 		}
 	}
 }
@@ -3226,7 +3263,7 @@ func (b *Brain) safeFallback() {
 		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
 		p.FFADrops, p.CubeStop, p.EarlyRetreat = 0, false, 0
-		p.LCDPunish = 0
+		p.LCDPunish, p.LightPad = 0, 0
 	}
 	off(&b.base)
 	b.regenOn = false
