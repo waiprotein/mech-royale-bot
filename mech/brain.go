@@ -74,9 +74,11 @@ type Brain struct {
 	coverGoal [2]float64
 	coverOK   bool
 
-	lastHurt    float64
-	hurtBearing float64
-	hurtSeenBy  bool
+	lastHurt float64
+	// rescan: end of the current full spin, and when the last one started.
+	rsUntil, rsAt float64
+	hurtBearing   float64
+	hurtSeenBy    bool
 
 	lootID    int
 	lootSince float64
@@ -401,6 +403,11 @@ type Params struct {
 	// no foe, walk directly away from the nearest mech seen in the last 5 s while it is closer than this (m);
 	// 0 -> 150 (real showdowns: top finishers keep the nearest mech ~145 m vs ~110 m). Negative = rule off.
 	EarlySpaceKeep float64
+	// Rescan [rescan]: ALL MODES. Idle aim only (no aim target). When calm (no damage taken for 3 s, no mech seen
+	// within 50 m, no laser holder and no mech that hit us in the last 10 s within 150 m), spin a full 360 deg every 6 s
+	// while gun-only and every 15 s once armed (laser or lightning); while walking, the scan alternates +/-0.9 rad
+	// around the bearing to the next zone centre every 1.6 s instead of giddy's sinusoid. No jet hop. false = off.
+	Rescan bool
 	// LaserLOS [laserlos]: FFA-only (ffaOn). Real showdown data: team-bot lasers hit 0.93-0.97 whatever the target
 	// does, but 24% of laser shots hit cover first. So dodge drops giddy's sidestep against a laser charger aimed at
 	// us, and while a mech is (or may still be) holding a charge aimed at us we break its line with coverMove if the
@@ -1710,9 +1717,18 @@ func (b *Brain) step(o *Obs, act *Action) {
 			aim[0] = b.soundBearing
 		case b.P.Scan > 0 && now < b.P.Scan:
 			aim[0] = me.Aim[0] + 1.2 // scan: spin to learn the pickups around the spawn
+		case b.P.Rescan && b.rescanSpin(o, seen, light != nil || laser != nil):
+			aim[0] = me.Aim[0] + 1.2 // rescan: keep turning at full slew for one full turn
 		case last != nil:
 			// watchlast: FFA-only; keep the last-seen mech in the 120° wedge with a ±52° sweep (above the scans).
 			aim[0] = math.Atan2(last.Pos[1]-y, last.Pos[0]-x) + 0.9*math.Sin(now*1.3)
+		case b.P.Rescan && (mx != 0 || my != 0):
+			// rescan walk-scan: +/-0.9 rad around the bearing to the next zone centre, switching every 1.6 s.
+			side := 0.9
+			if int(now/1.6)%2 == 1 {
+				side = -0.9
+			}
+			aim[0] = math.Atan2(o.Zone.NextCenter[1]-y, o.Zone.NextCenter[0]-x) + side
 		case mx != 0 || my != 0:
 			aim[0] = math.Atan2(my, mx) + 1.15*math.Sin(now*1.3)
 		default:
@@ -3117,6 +3133,37 @@ func losNow(seen []*Track, now float64) []*Track {
 	return out
 }
 
+// rescanSpin (rescan) reports whether a full spin is running or due: every 6 s gun-only, 15 s armed, only when calm
+// (no damage taken for 3 s; no mech seen within 50 m; no laser holder or mech that hit us in 10 s within 150 m).
+func (b *Brain) rescanSpin(o *Obs, seen []*Track, armed bool) bool {
+	if b.now < b.rsUntil {
+		return true
+	}
+	if b.now-b.lastHurt < 3 {
+		return false
+	}
+	x, y := o.Self.Pos[0], o.Self.Pos[1]
+	for _, t := range seen {
+		d := hyp(t.Pos[0]-x, t.Pos[1]-y)
+		if d < 50 || (d < 150 && (holds(t.Weapons, "laser") || b.now-t.HitMe < 10)) {
+			return false
+		}
+	}
+	every := 6.0
+	if armed {
+		every = 15
+	}
+	if b.now-b.rsAt < every {
+		return false
+	}
+	tr := o.Self.Stats.TurnRate
+	if tr <= 0 {
+		tr = 4
+	}
+	b.rsAt, b.rsUntil = b.now, b.now+2*math.Pi/tr+0.1
+	return true
+}
+
 func (b *Brain) reach(me *Self) float64 {
 	r := 0.0
 	for _, w := range me.Weapons {
@@ -3688,6 +3735,8 @@ func applyFlags(p *Params, spec string) {
 			p.WatchLast = f
 		case "homelos":
 			p.HomeLOS = f
+		case "rescan":
+			p.Rescan = on
 		case "chargeengage":
 			p.ChargeEngage = f
 		case "earlyspace":
@@ -3829,6 +3878,7 @@ func (b *Brain) safeFallback() {
 		p.LRLaser, p.LRHP, p.LRKeep = 0, 0, 0
 		p.RegenHide, p.WatchLast, p.HomeLOS, p.ChargeEngage = 0, 0, 0, 0
 		p.EarlySpace, p.EarlySpaceR, p.EarlySpaceKeep = 0, 0, 0
+		p.Rescan = false
 		p.RearAvoid, p.CoverReload = 0, false
 		p.FFADrops, p.CubeStop, p.EarlyRetreat = 0, false, 0
 		p.LaserLOS = 0
