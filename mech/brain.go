@@ -307,6 +307,17 @@ type Params struct {
 	// (cube 75 -> 188, crate 45 -> 113), to test the real-data marker "cubes at 60 s". 0 = off.
 	CubePush  float64
 	CubePushK float64
+	// ArmFirst [armfirst]: with Arm, ALL modes, before PracAt (20 s) while arm is active (gun-only): weapon first.
+	// The laser/lightning reach is always ArmRFar (160 m; arm alone drops to ArmR 120 m when a mech is within
+	// 150 m); a candidate's value is divided by 1 + the number of mechs seen in the last 5 s that have line of
+	// sight to it (prefer the pickup fewer mechs can see); and while any weapon candidate exists, cube, crate and
+	// drone detours are skipped (arm alone still lets a close cube or drone win, and keeps crates at giddy's
+	// value). With no candidate, arm's crate fallback still applies. No boost is added. Real data (Winner
+	// playbook "First 20 s"): second weapon by 20 s rho +0.22; weapon-before-cubes route +0.20, cube-first -0.11.
+	// Also (rival survey SPEC 2 "armrace", mechanics only): a pickup another mech is much closer to (< 0.6 x our
+	// distance) is worth x0.3; a pickup the zone reaches before our ETA + 8 s is skipped; and under fire we keep
+	// running to a weapon within 90 m when the foe, and every mech we see, is at least 70 m away.
+	ArmFirst bool
 	// GunOnlyR [gunonlyr]: with GunOnlyOut, only armed mechs closer than this count (0 = any range).
 	GunOnlyR float64
 	// CfgGate [cfggate]: allow the opening only when hello.config has the showdown/kit schedule (zone 560 m,
@@ -1259,6 +1270,8 @@ func (b *Brain) step(o *Obs, act *Action) {
 		mode = "chargecover"
 	case b.P.EarlySpace > 0 && now < b.earlySpaceT() && foe == nil && (laser != nil || light != nil) && b.earlyKeep(me, &mx, &my):
 		mode = "earlyspace" // walk away from the nearest recently seen mech until it is EarlySpaceKeep m away
+	case foe != nil && b.armRunUnderFire(o, me, foe, hpFrac, danger, &mx, &my):
+		mode = "arm:underfire" // armfirst: keep running to a weapon while the shooter is far
 	case foe != nil:
 
 		ready := gun != nil && gun.Ammo > 0 && gun.Reload <= 0.25 && foe.Dist <= gun.Stats.Range-10
@@ -2376,12 +2389,13 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 		return best
 	}
 	armOn := b.armActive(me)
+	armFirst := armOn && b.P.ArmFirst && now < dflt(b.base.PracAt, 20)
 	armCand := false
 	armR := 0.0
 	if armOn {
 		armR = dflt(b.P.ArmRFar, 160)
 		for _, t := range b.tracks {
-			if now-t.Seen < 5 && hyp(t.Pos[0]-x, t.Pos[1]-y) < 150 {
+			if !armFirst && now-t.Seen < 5 && hyp(t.Pos[0]-x, t.Pos[1]-y) < 150 {
 				armR = dflt(b.P.ArmR, 120)
 				break
 			}
@@ -2401,7 +2415,21 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 			}
 			if !blocked {
 				armCand = true
-				consider("pickup", p.ID, p.Pos, dflt(b.P.ArmV, 400))
+				v := dflt(b.P.ArmV, 400)
+				if armFirst {
+					d := hyp(p.Pos[0]-x, p.Pos[1]-y)
+					if now+d*1.4/me.Stats.WalkSpeed+8 > b.zoneDeadline(z, p.Pos[0], p.Pos[1], 6) {
+						continue // armfirst: the zone gets there first
+					}
+					v /= 1 + float64(b.losCount(p.Pos)) // armfirst: prefer the pickup fewer mechs can see
+					for _, t := range b.tracks {
+						if t.Kind == "mech" && now-t.Seen < 5 && hyp(t.Pos[0]-p.Pos[0], t.Pos[1]-p.Pos[1]) < 0.6*d {
+							v *= 0.3 // armfirst: contested, another mech is much closer to it
+							break
+						}
+					}
+				}
+				consider("pickup", p.ID, p.Pos, v)
 			}
 			continue
 		}
@@ -2432,8 +2460,9 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 	} else if b.P.CubePush > 0 && b.ffaNow && now < b.P.CubePush {
 		cubeV *= dflt(b.P.CubePushK, 2.5) // cubepush (crates use cubeV*0.6 below)
 	}
+	weaponFirst := armFirst && armCand // armfirst: no cube, crate or drone detours while a weapon is on offer
 	for _, c := range b.cubes {
-		if hyp(c.Pos[0]-x, c.Pos[1]-y) < math.Max(60, b.P.LootRadius*0.7) && !b.cubeSkip(me, c.Pos) {
+		if !weaponFirst && hyp(c.Pos[0]-x, c.Pos[1]-y) < math.Max(60, b.P.LootRadius*0.7) && !b.cubeSkip(me, c.Pos) {
 			consider("cube", c.ID, c.Pos, cubeV)
 		}
 	}
@@ -2441,7 +2470,7 @@ func (b *Brain) chooseLoot(o *Obs, hpFrac float64, danger bool) *lootChoice {
 	if b.P.FarmHP > 0 {
 		farmHP = b.P.FarmHP
 	}
-	if hpFrac > farmHP && !danger && now < b.P.CrateUntil {
+	if hpFrac > farmHP && !danger && now < b.P.CrateUntil && !weaponFirst {
 		for _, c := range b.crates {
 			if d := hyp(c.Pos[0]-x, c.Pos[1]-y); armOn && !armCand && d < dflt(b.P.ArmCrate, 60) && !b.cubeSkip(me, c.Pos) {
 				consider("crate", c.ID, c.Pos, 150) // arm: crate fallback (a crate drops a weapon half the time)
@@ -3216,6 +3245,37 @@ func (b *Brain) armActive(me *Self) bool {
 	return true
 }
 
+// armRunUnderFire (armfirst): with a foe, before PracAt and gun-only, keep walking to a weapon pickup within
+// 90 m (chooseLoot's arm candidate) when the foe and every mech seen this tick are at least 70 m away.
+func (b *Brain) armRunUnderFire(o *Obs, me *Self, foe *Track, hpFrac float64, danger bool, mx, my *float64) bool {
+	if !b.P.ArmFirst || b.now >= dflt(b.base.PracAt, 20) || !b.armActive(me) || foe.Dist < 70 {
+		return false
+	}
+	for _, t := range b.tracks {
+		if t.Kind == "mech" && t.Seen == b.now && t.Dist < 70 {
+			return false
+		}
+	}
+	lc := b.chooseLoot(o, hpFrac, danger)
+	if lc == nil || lc.kind != "pickup" || hyp(lc.pos[0]-me.Pos[0], lc.pos[1]-me.Pos[1]) >= 90 {
+		return false
+	}
+	*mx, *my = b.travel(me, lc.pos[0], lc.pos[1])
+	return true
+}
+
+// losCount (armfirst) counts mechs seen in the last 5 s whose eye has line of sight to a point 1 m above pos.
+func (b *Brain) losCount(pos Vec3) int {
+	n := 0
+	p := Vec3{pos[0], pos[1], pos[2] + 1}
+	for _, t := range b.tracks {
+		if t.Kind == "mech" && b.now-t.Seen < 5 && hyp(t.Pos[0]-pos[0], t.Pos[1]-pos[1]) < 230 && b.W.Clear(b.eye(t), p) {
+			n++
+		}
+	}
+	return n
+}
+
 // dflt returns v, or d when v is not set (<= 0).
 func dflt(v, d float64) float64 {
 	if v > 0 {
@@ -3578,6 +3638,8 @@ func applyFlags(p *Params, spec string) {
 			p.KeepLaser = on
 		case "arm":
 			p.Arm = on
+		case "armfirst":
+			p.ArmFirst = on
 		case "armprac":
 			p.ArmPrac = on
 		case "armstrict":
@@ -3772,7 +3834,7 @@ func (b *Brain) safeFallback() {
 		p.LaserLOS = 0
 		p.LCDPunish, p.LightPad, p.SmartFire = 0, 0, 0
 		p.CautiousT, p.PracRim = 0, 0
-		p.Arm, p.Scan, p.CubePush = false, 0, 0
+		p.Arm, p.Scan, p.CubePush, p.ArmFirst = false, 0, 0, false
 	}
 	off(&b.base)
 	b.regenOn = false
